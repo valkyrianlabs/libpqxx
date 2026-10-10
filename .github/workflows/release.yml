@@ -42,7 +42,7 @@ concurrency:
 env:
   RELEASE_REF: ${{ github.event.inputs.ref || github.ref }}
   CI_CACHE_NAMES: ccache
-  PQXX_JOBS: "4"
+  PQXX_JOBS: "8"
   CI_MEMORY: 6g
   PROFILE: ubuntu-24.04-amd64
 

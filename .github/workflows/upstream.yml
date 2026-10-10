@@ -21,7 +21,7 @@ concurrency:
 
 env:
   CI_CACHE_NAMES: ccache
-  PQXX_JOBS: "4"
+  PQXX_JOBS: "8"
   CI_MEMORY: 6g
 
 jobs:

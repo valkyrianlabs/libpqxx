@@ -16,7 +16,7 @@ like Vaulthalla and PDFium. Nothing runs on the host directly:
 
 | Control | Default | Where |
 |---|---|---|
-| Compile parallelism | `PQXX_JOBS=4` | workflow `env` → `pqxx-sdk build` |
+| Compile parallelism | `PQXX_JOBS=8` (the `vps` runner has 10 threads) | workflow `env` → `pqxx-sdk build` |
 | Container memory | `CI_MEMORY=6g` | `ci/run-ci --memory` |
 | One heavy build per runner user | `flock ~/.cache/libpqxx-ci/heavy-build.lock`, waits ≤ 90 min | `tools/ci-guard` |
 | Free disk before heavy steps | 4 GiB at work tree, caches, Podman storage | `tools/ci-guard` (`PQXX_MIN_FREE_GIB`) |
@@ -24,9 +24,9 @@ like Vaulthalla and PDFium. Nothing runs on the host directly:
 | Workflow concurrency | CI cancels superseded runs; releases queue; one Nexus Raw publication at a time | workflow `concurrency` |
 | Job timeouts | 10–90 min | workflows |
 
-Measured on the development machine (18 threads): the libpqxx compile including upstream tests
-takes about 70 s at `-j8` (roughly 2–3 min at `-j4`), upstream's suite 3 s, `sdk-test` 15 s, each
-container case about 1 min (mostly `apt-get`). The release job logs the container's peak memory;
+Measured: the libpqxx compile including upstream tests takes about 70 s at `-j8` on the
+development machine (18 threads) and 134 s at `-j4` on the `vps` runner (10 threads); upstream's
+suite 3 s, `sdk-test` 15–20 s, each container case about 1 min (mostly `apt-get`). The release job logs the container's peak memory;
 check it on the first runner runs. The lock is per project (PDFium has its own); if both build at
 once on a small runner, point `PQXX_LOCK_FILE` at PDFium's lock to serialize them.
 
