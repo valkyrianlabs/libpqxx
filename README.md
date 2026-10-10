@@ -18,16 +18,13 @@ no committed upstream source, no system-wide libpqxx anywhere.
 
 ## Status
 
-- The 8.0.2 SDK for `ubuntu-24.04-amd64` builds, passes upstream's 298 tests, and passes every
-  consumer, acquisition, publication-rule, container (Ubuntu 24.04 / 26.04) and Debian-package
-  test (`tools/release-rehearsal`).
-- **Not published.** The Nexus raw repository (`cpp-sdk`) does not exist yet. Creating it and the
-  first release need approval (docs/RELEASING.md, checklist).
-- **Vaulthalla needs two changes before switching** (docs/CONSUMING.md):
-  - declare the libpqxx dependency on its `vhseed` target;
-  - migrate 111 call sites to libpqxx 8's `row_ref`/`field_ref` API.
-
-  A 7.10.7 SDK from the same tooling works with today's Vaulthalla sources as an interim step.
+- **Released: `8.0.2-1`** (tag `v8.0.2-1`). `libpqxx-vh-dev 8.0.2-1` is published on
+  `apt.vaulthalla.sh`, and the SDK archive, manifest and test record are attached to the GitHub
+  release. Release CI built it once on the `vps` runner, ran upstream's 298 tests and the full
+  consumer/container/package test matrix, published it, and verified the APT index by sha256.
+- Nexus Raw publication of the SDK archive is optional and not enabled (docs/RELEASING.md).
+- Vaulthalla's switch to libpqxx 8 (and to `libpqxx-vh-dev`) is in progress in its own
+  repository; docs/CONSUMING.md lists what the trial compiles found.
 
 ## SDK layout
 
