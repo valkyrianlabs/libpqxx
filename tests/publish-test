@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""Nexus Raw publication rules of `tools/pqxx-sdk publish`, against a local mock Nexus (never the
+real one).
+
+    tests/publish-test DIST_DIR
+
+DIST_DIR holds the SDK assets (archive, .sha256, .manifest.json). The mock implements what the
+publisher uses: GET/PUT under /repository/<name>/ with basic auth for writes, and
+/service/rest/v1/repositories. Checks: the test-record gate, disabled mode, the repository
+preflight, dry run, upload + verification, idempotent re-run, refusal to replace different bytes,
+rejected credentials, and that credentials never appear in a process's argv.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import http.server
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+USER, PASSWORD = "sdk-publisher", "s3cret-not-in-argv"
+results: list[dict] = []
+
+
+class MockNexus:
+    def __init__(self):
+        self.store: dict[str, bytes] = {}
+        self.puts: list[str] = []
+        self.repos = [{"name": "cpp-sdk", "format": "raw", "type": "hosted"},
+                      {"name": "vaulthalla-apt", "format": "apt", "type": "hosted"}]
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _authorized(self) -> bool:
+                expected = "Basic " + base64.b64encode(f"{USER}:{PASSWORD}".encode()).decode()
+                return self.headers.get("Authorization") == expected
+
+            def do_GET(self):  # noqa: N802
+                if self.path == "/service/rest/v1/repositories":
+                    body = json.dumps(outer.repos).encode()
+                elif self.path in outer.store:
+                    body = outer.store[self.path]
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_PUT(self):  # noqa: N802
+                data = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                if not self._authorized():
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                if not self.path.startswith("/repository/cpp-sdk/"):
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                outer.puts.append(self.path)
+                outer.store[self.path] = data
+                self.send_response(201)
+                self.end_headers()
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+
+def expect(name: str, ok: bool, detail: str = "") -> None:
+    results.append({"check": name, "ok": ok, "detail": detail})
+    print(f"  {'ok  ' if ok else 'FAIL'} {name}{': ' + detail[-800:] if detail and not ok else ''}", flush=True)
+
+
+def publish(out: Path, *args: str, env: dict) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, str(REPO / "tools" / "pqxx-sdk"), "publish", "--output-dir", str(out), *args],
+                          text=True, capture_output=True, env=env)
+
+
+def main() -> int:
+    dist = Path(sys.argv[1]).resolve()
+    version = json.loads(subprocess.run([sys.executable, str(REPO / "tools" / "pqxx-sdk"), "version"],
+                                        capture_output=True, text=True, check=True).stdout)
+    work = Path(tempfile.mkdtemp(prefix="libpqxx-sdk-publish-test-"))
+    out = work / "dist"
+    out.mkdir()
+    for path in dist.glob(f"libpqxx-sdk-{version['sdk_version']}-*"):
+        if not path.name.endswith(".tests.json"):
+            shutil.copy2(path, out / path.name)
+    profile = next(iter(version["profiles"].values()))
+    archive = out / profile["archive"]
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    record = out / profile["archive"].replace(".tar.zst", ".tests.json")
+
+    nexus = MockNexus()
+    base = f"{nexus.url}/repository/cpp-sdk"
+    env = dict(os.environ, NEXUS_RAW_REPO=base, NEXUS_USER=USER, NEXUS_PASSWORD=PASSWORD,
+               PQXX_SDK_ALLOW_LOCAL_NEXUS="1", RELEASE_PUBLISH_MODE="nexus")
+    env.pop("NEXUS_PASS", None)
+    remote = f"/repository/cpp-sdk/{profile['nexus_path']}"
+    try:
+        print("== gate")
+        r = publish(out, env=env)
+        expect("no consumer test record: refused before any request", r.returncode == 1 and "no passing consumer test record"
+               in r.stderr and not nexus.puts, r.stderr)
+        record.write_text(json.dumps({"result": "passed", "archive_sha256": "0" * 64}))
+        r = publish(out, env=env)
+        expect("test record for other bytes: refused", r.returncode == 1 and not nexus.puts, r.stderr)
+        record.write_text(json.dumps({"result": "passed", "archive_sha256": digest}))
+        r = publish(out, env=dict(env, RELEASE_PUBLISH_MODE="disabled"))
+        expect("RELEASE_PUBLISH_MODE=disabled: gate passes, nothing uploaded", r.returncode == 0 and not nexus.puts
+               and "not publishing" in r.stderr, r.stderr)
+        r = publish(out, "--require-enabled", env=dict(env, RELEASE_PUBLISH_MODE="disabled"))
+        expect("--require-enabled with publication disabled fails", r.returncode == 1, r.stderr)
+
+        print("== preflight and dry run")
+        r = publish(out, "--dry-run", env=dict(env, NEXUS_RAW_REPO=f"{nexus.url}/repository/cpp-sdk-typo"))
+        expect("missing repository is refused (3), not treated as empty", r.returncode == 3 and "does not exist" in r.stderr,
+               r.stderr)
+        r = publish(out, "--dry-run", env=dict(env, NEXUS_RAW_REPO=f"{nexus.url}/repository/vaulthalla-apt"))
+        expect("non-raw repository is refused (3)", r.returncode == 3 and "not raw/hosted" in r.stderr, r.stderr)
+        r = publish(out, "--dry-run", env=env)
+        expect("dry run plans 3 uploads and uploads nothing", r.returncode == 0 and r.stderr.count(" upload  ") == 3
+               and not nexus.puts, r.stderr)
+
+        print("== publish")
+        r = subprocess.Popen([sys.executable, str(REPO / "tools" / "pqxx-sdk"), "publish", "--output-dir", str(out)],
+                             env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        leaked = False
+        while r.poll() is None:  # sample every process's argv while the upload runs
+            for cmdline in Path("/proc").glob("[0-9]*/cmdline"):
+                try:
+                    leaked |= PASSWORD.encode() in cmdline.read_bytes()
+                except OSError:
+                    pass
+        stderr = r.stderr.read()
+        expected = [f"{remote}/libpqxx-sdk.tar.zst", f"{remote}/libpqxx-sdk.tar.zst.sha256", f"{remote}/manifest.json"]
+        expect("uploads archive, .sha256, manifest.json in that order", r.returncode == 0 and nexus.puts == expected,
+               f"{nexus.puts}\n{stderr}")
+        expect("published bytes verified by download", stderr.count("verified ") == 3, stderr)
+        expect("password never in any process argv", not leaked)
+        expect("published archive is byte-identical", hashlib.sha256(nexus.store[expected[0]]).hexdigest() == digest)
+        expect("published .sha256 names the archive",
+               nexus.store[expected[1]].decode() == f"{digest}  libpqxx-sdk.tar.zst\n", nexus.store[expected[1]].decode())
+        side = json.loads(nexus.store[expected[2]])
+        expect("published manifest.json carries the archive digest", side["archive"]["sha256"] == digest)
+
+        r = publish(out, env=env)
+        expect("re-run skips identical files (idempotent)", r.returncode == 0 and len(nexus.puts) == 3
+               and r.stderr.count("   skip  ") == 3, r.stderr)
+
+        nexus.store[expected[2]] = b'{"tampered": true}'
+        r = publish(out, env=env)
+        expect("different bytes already published: refused (3), nothing replaced",
+               r.returncode == 3 and len(nexus.puts) == 3 and "different bytes" in r.stderr, r.stderr)
+        r = subprocess.run([sys.executable, str(REPO / "tools" / "pqxx-sdk"), "verify-published", "--output-dir", str(out),
+                            "--timeout", "1"], text=True, capture_output=True, env=env)
+        expect("verify-published detects the tampered file", r.returncode != 0 and "manifest.json" in r.stderr, r.stderr)
+
+        nexus.store.clear()
+        nexus.puts.clear()
+        r = publish(out, env=dict(env, NEXUS_PASSWORD="wrong"))
+        expect("rejected credentials fail the upload", r.returncode == 1 and not nexus.puts, r.stderr)
+    finally:
+        nexus.httpd.shutdown()
+        shutil.rmtree(work, ignore_errors=True)
+
+    failed = [r for r in results if not r["ok"]]
+    print(f"publish-test: {'FAILED' if failed else 'PASSED'} ({len(results) - len(failed)}/{len(results)})")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Run a command against a throwaway PostgreSQL cluster.
+#
+#   tests/pg-sandbox COMMAND [ARGS...]
+#
+# initdb's a private cluster in a fresh temporary directory (unix socket only, no TCP, fsync off),
+# exports PGHOST/PGPORT/PGUSER/PGDATABASE for COMMAND, then stops it and deletes everything,
+# whatever COMMAND's outcome. Needs the PostgreSQL server binaries (postgresql-NN; the CI image has
+# them) and must not run as root (initdb refuses). Nothing outside the temporary directory changes.
+set -euo pipefail
+
+[ "$#" -gt 0 ] || { echo "usage: tests/pg-sandbox COMMAND [ARGS...]" >&2; exit 2; }
+[ "$(id -u)" -ne 0 ] || { echo "pg-sandbox: refusing to run as root" >&2; exit 2; }
+
+bindir=""
+for candidate in $(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V -r); do
+  if [ -x "$candidate/initdb" ] && [ -x "$candidate/pg_ctl" ]; then bindir=$candidate; break; fi
+done
+[ -n "$bindir" ] || { echo "pg-sandbox: no PostgreSQL server binaries (install postgresql-16)" >&2; exit 2; }
+
+dir="$(mktemp -d "${TMPDIR:-/tmp}/pg-sandbox.XXXXXX")"
+cleanup() {
+  "$bindir/pg_ctl" -D "$dir/data" -m immediate stop >/dev/null 2>&1 || true
+  rm -rf "$dir"
+}
+trap cleanup EXIT
+
+"$bindir/initdb" -D "$dir/data" -U "$(id -un)" --auth=trust --encoding=UTF8 --locale=C.UTF-8 >"$dir/initdb.log" 2>&1 ||
+  { cat "$dir/initdb.log" >&2; exit 1; }
+"$bindir/pg_ctl" -D "$dir/data" -l "$dir/server.log" -w -t 60 \
+  -o "-k $dir -c listen_addresses='' -c fsync=off -c synchronous_commit=off -c full_page_writes=off" start >/dev/null ||
+  { cat "$dir/server.log" >&2; exit 1; }
+
+export PGHOST="$dir" PGPORT=5432 PGUSER="$(id -un)" PGDATABASE=pqxx_test
+unset DATABASE_URL PGPASSWORD PGSERVICE
+"$bindir/createdb" pqxx_test
+echo "pg-sandbox: PostgreSQL $("$bindir/postgres" --version | awk '{print $3}') at $PGHOST (database $PGDATABASE)" >&2
+
+status=0
+"$@" || status=$?
+exit "$status"

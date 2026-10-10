@@ -1,0 +1,77 @@
+# vl-release repository contract: https://github.com/valkyrianlabs/vl-release
+# `vlr help config` documents every key. Release CI (.github/workflows/release.yml) calls `vlr`
+# commands plus this repository's tooling (tools/pqxx-sdk, tests/). vl-release owns versions,
+# release notes, debian/changelog, the optional APT publication, GitHub releases and finalize;
+# `tools/pqxx-sdk publish` adds the optional Nexus Raw channel vl-release has no notion of (docs/RELEASING.md).
+schema_version = 1
+
+[tool]
+requires = ">=0.5,<1"  # 0.5: [version] policy
+
+[project]
+name = "Vaulthalla libpqxx SDK"
+package = "libpqxx-vh"
+repository = "vaulthalla/libpqxx"
+
+[version]
+# UPSTREAM-REVISION: 8.0.2-1 is upstream libpqxx 8.0.2, SDK revision 1, and is also the tag
+# (v8.0.2-1), the Debian package version and the Nexus path segment. Packaging-only change:
+# `vlr cut revision` (8.0.2-2). New upstream: `tools/pqxx-sdk pin`, then `vlr version upstream
+# 8.0.3` (8.0.3-1); `tools/pqxx-sdk check` enforces that VERSION matches upstream.lock.json.
+canonical = "VERSION"
+policy = "debian-upstream"
+targets = []
+
+[release]
+branch = "main"
+# Everything generated stays under the ignored release/: release/build is the disposable
+# workspace (downloads, source, compile, stage, sdk, deb, metadata), release/dist the assets.
+build_dir = "release/build"
+output_dir = "release/dist"
+# Fast checks `vlr cut` runs before tagging. The SDK itself is gated by CI (build, upstream tests,
+# consumer tests) before anything is published.
+test_command = ["python3", "-m", "unittest", "discover", "-s", "tests/unit", "-t", "."]
+
+[debian]
+distribution = "unstable"
+urgency = "medium"
+maintainer = "Cooper Larson <cooper@valkyrianlabs.com>"
+# libpqxx-vh-dev repackages the SDK archive already built in release/build/sdk/dist (debian/rules
+# compiles nothing); the SDK archives, checksums and manifests then join the release assets.
+build_excludes = [".idea", ".claude"]
+extra_artifacts = ["release/build/sdk/dist/*"]
+
+[[debian.packages]]
+name = "libpqxx-vh-dev"
+architecture = "amd64"
+required_paths = [
+  "usr/lib/x86_64-linux-gnu/libpqxx-vh/lib/libpqxx.a",
+  "usr/lib/x86_64-linux-gnu/libpqxx-vh/lib/pkgconfig/libpqxx-vh.pc",
+  "usr/lib/x86_64-linux-gnu/libpqxx-vh/include/pqxx/pqxx",
+  "usr/lib/x86_64-linux-gnu/libpqxx-vh/manifest.json",
+  "usr/lib/x86_64-linux-gnu/libpqxx-vh/licenses/libpqxx/COPYING",
+  "usr/lib/x86_64-linux-gnu/pkgconfig/libpqxx-vh.pc",
+  "usr/share/doc/libpqxx-vh-dev/copyright",
+]
+# Side by side with Ubuntu's libpqxx-dev / libpqxx-<abi> and the legacy fork: nothing in their
+# paths, no shared library, no unnamespaced pkg-config or CMake metadata.
+forbidden_paths = [
+  "usr/include/*",
+  "usr/lib/x86_64-linux-gnu/libpqxx.*",
+  "usr/lib/x86_64-linux-gnu/libpqxx-[0-9]*",
+  "usr/lib/x86_64-linux-gnu/pkgconfig/libpqxx.pc",
+  "usr/lib/x86_64-linux-gnu/cmake/*",
+  "*.so",
+  "*.so.*",
+]
+
+[publish.apt]
+# The primary distribution channel (docs/RELEASING.md): Vaulthalla's APT repository. Upload URL
+# and credentials come from the Production environment (NEXUS_REPO_URL, NEXUS_USER, NEXUS_PASS,
+# as for Vaulthalla and PDFium); RELEASE_PUBLISH_MODE=nexus enables uploads.
+repository_url = "https://apt.vaulthalla.sh"
+suite = "stable"
+components = ["main"]
+architectures = ["amd64"]
+verify_timeout = 1800
+verify_interval = 30

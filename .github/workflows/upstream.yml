@@ -1,0 +1,91 @@
+name: Upstream watch
+
+# Weekly: has jtv/libpqxx published a newer *stable* release (by version; prereleases ignored)?
+# If so, pin it, build and test it as a candidate (tools/upstream-candidate) and open a pull
+# request with the report. Nothing is released automatically: a maintainer reviews, merges and
+# cuts the release with `vlr cut` (docs/MAINTENANCE.md).
+#
+# Needs "Allow GitHub Actions to create and approve pull requests" in the repository settings.
+
+on:
+  schedule:
+    - cron: "41 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
+
+env:
+  CI_CACHE_NAMES: ccache
+  PQXX_JOBS: "4"
+  CI_MEMORY: 6g
+
+jobs:
+  discover:
+    runs-on: [self-hosted, Linux, X64, vaulthalla, vps-ci]
+    defaults:
+      run:
+        shell: bash ./ci/run-ci bash -euo pipefail {0}
+    timeout-minutes: 10
+    outputs:
+      update: ${{ steps.discover.outputs.update }}
+      latest: ${{ steps.discover.outputs.latest }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: discover
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/pqxx-sdk discover --github-output
+
+  candidate:
+    needs: discover
+    if: needs.discover.outputs.update == 'true'
+    runs-on: [self-hosted, Linux, X64, vaulthalla, vps-ci]
+    permissions:
+      contents: write
+      pull-requests: write
+    timeout-minutes: 60
+    env:
+      BRANCH: upstream/libpqxx-${{ needs.discover.outputs.latest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Skip if a pull request branch for this release exists
+        id: existing
+        shell: bash ./ci/run-ci bash -euo pipefail {0}
+        run: |
+          if git ls-remote --exit-code origin "refs/heads/$BRANCH" >/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Pin, build and test the candidate
+        id: candidate
+        if: steps.existing.outputs.exists == 'false'
+        continue-on-error: true
+        shell: bash ./tools/ci-guard -- ./ci/run-ci bash -euo pipefail {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: tools/upstream-candidate "${{ needs.discover.outputs.latest }}"
+      - name: Open a pull request with the report
+        if: steps.existing.outputs.exists == 'false'
+        shell: bash ./ci/run-ci bash -euo pipefail {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUTCOME: ${{ steps.candidate.outcome }}
+          LATEST: ${{ needs.discover.outputs.latest }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          git add -A upstream.lock.json VERSION .release
+          git commit -m "Update libpqxx to $LATEST"
+          git push origin "$BRANCH"
+          title="Update libpqxx to $LATEST"
+          [ "$OUTCOME" = "success" ] || title="$title (needs work)"
+          gh pr create --base main --head "$BRANCH" --title "$title" --body-file release/build/upstream-candidate/report.md

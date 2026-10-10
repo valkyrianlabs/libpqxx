@@ -1,0 +1,60 @@
+# Build and compatibility profile: one SDK artifact identity per profile.
+#
+# A profile pins everything that decides binary compatibility of the static archive. The SDK
+# manifest records these values plus what the build actually measured (exact compiler, glibc and
+# libpq versions, highest symbol versions the archive needs). `tools/pqxx-sdk build` refuses to run
+# in an environment that does not match [build].
+id = "ubuntu-24.04-amd64"
+status = "supported"  # supported | planned
+
+[target]
+os = "ubuntu"
+os_version = "24.04"            # the oldest Ubuntu release this SDK supports
+codename = "noble"
+glibc = "2.39"                  # noble's glibc: the SDK may reference symbols up to this version
+debian_arch = "amd64"
+gnu_triplet = "x86_64-linux-gnu"
+abi = "x86-64 System V, LP64, ELF"
+isa_baseline = "x86-64"         # generic baseline: no x86-64-v2/v3, no -march=native
+
+[build]
+# Must match ci/Containerfile's FROM (tests/unit checks it).
+image = "docker.io/library/ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55"
+cxx = "g++-14"
+compiler_family = "gcc"
+compiler_major = 14
+cxx_std = "20"
+build_type = "Release"          # upstream CMake's Release configuration: -O3 -DNDEBUG
+pic = true                      # usable from PIE executables (Ubuntu's default) and shared objects
+lto = false                     # plain object code: no compiler/linker version coupling
+# Appended to CMAKE_CXX_FLAGS. Generic tuning plus the hardening Ubuntu's toolchain applies by
+# default, made explicit so the archive is hardened regardless of compiler defaults.
+cxx_flags = [
+  "-march=x86-64",
+  "-mtune=generic",
+  "-fstack-protector-strong",
+  "-fstack-clash-protection",
+  "-fcf-protection",
+  "-D_GLIBCXX_USE_CXX11_ABI=1",
+]
+
+[stdlib]
+name = "libstdc++"
+cxx11_abi = true                # std::string/std::list use the C++11 ABI (__cxx11 symbols)
+
+[libpq]
+# libpqxx's public headers do not include libpq-fe.h; consumers need only the runtime library.
+runtime_package = "libpq5"
+soname = "libpq.so.5"
+build_package = "libpq-dev"     # the distribution's; headers used to compile the archive
+
+[consumers]
+compiler_family = "gcc"
+min_compiler_major = 14         # config.h feature macros were detected with g++ 14
+cxx_std = ["20", "23"]
+# Stock images the consumer tests run in (tests/containers). Newer Ubuntu releases are supported
+# only once listed here and passing.
+tested_images = [
+  "docker.io/library/ubuntu:24.04",
+  "docker.io/library/ubuntu:26.04",
+]

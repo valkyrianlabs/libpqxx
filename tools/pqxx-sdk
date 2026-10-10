@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+"""pqxx-sdk: pin, build, inspect and publish the Vaulthalla libpqxx static SDK (see README.md)."""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from pqxxsdk.cli import main  # noqa: E402
+
+sys.exit(main())

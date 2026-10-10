@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""Acquisition behaviour of tools/libpqxx-sdk-fetch against a local Nexus-shaped server.
+
+    tests/fetch-test ARCHIVE [--record FILE]
+
+Covers: first download, cache reuse with the server gone, --offline, unpublished profile (404),
+tampered download (checksum mismatch, nothing cached), damaged cache entry (detected and healed),
+manifest that does not match the pin, incompatible host target, malformed pin, and concurrent
+acquisitions sharing one cache (one download).
+"""
+
+from __future__ import annotations
+
+import argparse
+import functools
+import hashlib
+import http.server
+import io
+import json
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+FETCH = REPO / "tools" / "libpqxx-sdk-fetch"
+results: list[dict] = []
+
+
+class Server:
+    def __init__(self, root: Path):
+        self.requests: list[str] = []
+        outer = self
+
+        class Handler(http.server.SimpleHTTPRequestHandler):
+            def log_message(self, *args):  # noqa: D401
+                pass
+
+            def do_GET(self):  # noqa: N802
+                outer.requests.append(self.path)
+                super().do_GET()
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Handler, directory=str(root)))
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def fetch(pin: Path, cache: Path, *extra: str) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, "-I", str(FETCH), "--pin", str(pin), "--cache-dir", str(cache),
+                           "--format", "json", *extra], text=True, capture_output=True)
+
+
+def expect(name: str, ok: bool, detail: str = "") -> None:
+    results.append({"check": name, "ok": ok, "detail": detail})
+    print(f"  {'ok  ' if ok else 'FAIL'} {name}{': ' + detail if detail and not ok else ''}", flush=True)
+
+
+def repack(archive: Path, mutate) -> bytes:
+    """Rewrite the archive with manifest.json changed by `mutate` (file digests untouched)."""
+    raw = subprocess.run(["zstd", "-dc", str(archive)], check=True, capture_output=True).stdout
+    out = io.BytesIO()
+    with tarfile.open(fileobj=io.BytesIO(raw)) as src, tarfile.open(fileobj=out, mode="w", format=tarfile.PAX_FORMAT) as dst:
+        for member in src.getmembers():
+            data = src.extractfile(member).read() if member.isfile() else None
+            if member.name.endswith("/manifest.json"):
+                manifest = json.loads(data)
+                mutate(manifest)
+                data = json.dumps(manifest).encode()
+                member.size = len(data)
+            dst.addfile(member, io.BytesIO(data) if data is not None else None)
+    return subprocess.run(["zstd", "-q", "-c"], input=out.getvalue(), check=True, capture_output=True).stdout
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("archive", type=Path)
+    parser.add_argument("--record", type=Path)
+    args = parser.parse_args()
+    archive = args.archive.resolve()
+    data = archive.read_bytes()
+    digest = sha(data)
+    manifest = json.loads(archive.with_name(archive.name.removesuffix(".tar.zst") + ".manifest.json").read_text())
+    version, profile = manifest["sdk_version"], manifest["profile"]
+
+    work = Path(tempfile.mkdtemp(prefix="libpqxx-sdk-fetch-test-"))
+    remote = work / "nexus"
+
+    def publish(prof: str, payload: bytes) -> None:
+        d = remote / "libpqxx" / version / prof
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "libpqxx-sdk.tar.zst").write_bytes(payload)
+        (d / "libpqxx-sdk.tar.zst.sha256").write_text(f"{sha(payload)}  libpqxx-sdk.tar.zst\n")
+
+    def pin(name: str, *, prof: str = profile, sha256: str = digest, base: str | None = None, ver: str = version) -> Path:
+        path = work / f"{name}.toml"
+        path.write_text(f'sdk_version = "{ver}"\nprofile = "{prof}"\nsha256 = "{sha256}"\nbase_url = "{base or server.url}"\n')
+        return path
+
+    publish(profile, data)
+    server = Server(remote)
+    try:
+        cache = work / "cache"
+        good = pin("good")
+
+        print("== first acquisition and cache reuse")
+        r = fetch(good, cache)
+        info = json.loads(r.stdout) if r.returncode == 0 else {}
+        expect("first run downloads and installs", r.returncode == 0 and Path(info.get("pkg_config_path", "/x")).is_dir()
+               and (Path(info["pkg_config_path"]) / "libpqxx-vh.pc").is_file(), r.stderr)
+        downloads = [p for p in server.requests if p.endswith(".tar.zst")]
+        expect("exactly one download", len(downloads) == 1, str(server.requests))
+        r2 = fetch(good, cache)
+        expect("second run reuses the cache without requests", r2.returncode == 0 and len(server.requests) == 1
+               and "cached:" in r2.stderr, r2.stderr)
+        r_off = fetch(good, cache, "--offline")
+        expect("--offline uses the cache", r_off.returncode == 0, r_off.stderr)
+        r_fmt = subprocess.run([sys.executable, "-I", str(FETCH), "--pin", str(good), "--cache-dir", str(cache),
+                                "--format", "meson"], text=True, capture_output=True)
+        expect("--format meson prints -Dpkg_config_path", r_fmt.stdout.startswith("-Dpkg_config_path=/"), r_fmt.stdout)
+
+        print("== failures")
+        r = fetch(good, work / "empty-cache", "--offline")
+        expect("--offline with an empty cache fails as unavailable (4)", r.returncode == 4 and "not cached" in r.stderr, r.stderr)
+        r = fetch(pin("arm", prof="ubuntu-24.04-arm64"), work / "c404")
+        expect("unpublished profile fails as unavailable (4)", r.returncode == 4 and "not published" in r.stderr, r.stderr)
+        r = fetch(pin("nover", ver="9.9.9-1"), work / "c404v")
+        expect("unpublished version fails as unavailable (4)", r.returncode == 4 and "not published" in r.stderr, r.stderr)
+        r = fetch(pin("down", base="http://127.0.0.1:9"), work / "cdown")
+        expect("unreachable repository fails as unavailable (4)", r.returncode == 4, r.stderr)
+
+        tampered_cache = work / "c-tampered"
+        publish("ubuntu-24.04-tampered", data + b"\0")
+        r = fetch(pin("tampered", prof="ubuntu-24.04-tampered"), tampered_cache)
+        expect("tampered download fails the checksum (3)", r.returncode == 3 and "checksum mismatch" in r.stderr, r.stderr)
+        leftovers = [p.name for p in tampered_cache.rglob("*") if p.is_file() and p.name != ".lock"]
+        expect("nothing from the tampered download is cached", not leftovers, str(leftovers))
+
+        entry = next(cache.iterdir())
+        lib = next(entry.glob("sdk/*/lib/libpqxx.a"))
+        original = lib.read_bytes()
+        lib.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
+        requests_before = len(server.requests)
+        r = fetch(good, cache, "--offline")
+        expect("damaged extracted SDK is detected and re-extracted offline", r.returncode == 0 and "damaged" in r.stderr and len(server.requests) == requests_before
+               and next(entry.glob("sdk/*/lib/libpqxx.a")).read_bytes() == original, r.stderr)
+        (entry / "libpqxx-sdk.tar.zst").write_bytes(b"garbage")
+        server_before = len(server.requests)
+        r = fetch(good, cache, "--offline")
+        expect("damaged archive in the cache is not trusted offline (4)", r.returncode == 4, r.stderr)
+        r = fetch(good, cache)
+        expect("...and heals with network access", r.returncode == 0 and len(server.requests) == server_before + 1, r.stderr)
+
+        wrong = repack(archive, lambda m: m.update(profile="ubuntu-99.04-amd64"))
+        publish("ubuntu-24.04-wrongmanifest", wrong)
+        r = fetch(pin("wrongmanifest", prof="ubuntu-24.04-wrongmanifest", sha256=sha(wrong)), work / "c-wm")
+        expect("archive whose manifest names another profile is rejected (3)", r.returncode == 3 and "manifest profile" in r.stderr,
+               r.stderr)
+
+        def future_target(m: dict) -> None:
+            m["target"]["os_version"] = "99.04"
+            m["profile"] = "ubuntu-24.04-future"
+        future = repack(archive, future_target)
+        publish("ubuntu-24.04-future", future)
+        future_pin = pin("future", prof="ubuntu-24.04-future", sha256=sha(future))
+        r = fetch(future_pin, work / "c-future")
+        expect("SDK for a newer OS release is refused on this host (1)", r.returncode == 1 and "not compatible" in r.stderr,
+               r.stderr)
+        r = fetch(future_pin, work / "c-future", "--no-host-check")
+        expect("--no-host-check overrides the host check", r.returncode == 0, r.stderr)
+
+        bad = work / "bad.toml"
+        bad.write_text('sdk_version = "latest"\nprofile = "ubuntu-24.04-amd64"\nsha256 = "abc"\n')
+        r = fetch(bad, work / "c-bad")
+        expect("malformed pin is rejected (1)", r.returncode == 1 and "malformed" in r.stderr, r.stderr)
+        insecure = pin("insecure", base="http://repo.example.com/repository/cpp-sdk")
+        r = fetch(insecure, work / "c-insecure")
+        expect("non-HTTPS remote base_url is rejected (1)", r.returncode == 1 and "https" in r.stderr, r.stderr)
+
+        print("== concurrency")
+        shared = work / "c-shared"
+        before = len([p for p in server.requests if p.endswith(f"{profile}/libpqxx-sdk.tar.zst")])
+        with ThreadPoolExecutor(4) as pool:
+            runs = list(pool.map(lambda _: fetch(good, shared), range(4)))
+        after = len([p for p in server.requests if p.endswith(f"{profile}/libpqxx-sdk.tar.zst")])
+        expect("4 concurrent acquisitions succeed with one download",
+               all(r.returncode == 0 for r in runs) and after - before == 1, f"{after - before} downloads")
+    finally:
+        server.close()
+        shutil.rmtree(work, ignore_errors=True)
+
+    failed = [r for r in results if not r["ok"]]
+    print(f"fetch-test: {'FAILED' if failed else 'PASSED'} ({len(results) - len(failed)}/{len(results)})")
+    if args.record:
+        args.record.parent.mkdir(parents=True, exist_ok=True)
+        args.record.write_text(json.dumps({"result": "failed" if failed else "passed", "archive_sha256": digest,
+                                           "checks": results}, indent=2) + "\n")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Rehearse a release locally, without publishing anything.
+#
+#   tools/release-rehearsal [--skip-container-tests] [--nexus-dry-run]
+#
+# Copies the current work tree (tracked and untracked-but-not-ignored files, so uncommitted work
+# is included) into release/rehearsal/libpqxx, commits it there (never in this repository), and
+# runs what release CI runs, inside the CI container:
+#   vlr check --release; pqxx-sdk check; vlr prepare; pqxx-sdk build --tests (upstream test
+#   suite against a throwaway PostgreSQL); vlr build-deb (repackages that SDK); tests/sdk-test
+#   (the publication gate record); tests/fetch-test; tests/publish-test (mock Nexus);
+#   vlr checksums; vlr validate-artifacts; pqxx-sdk publish (RELEASE_PUBLISH_MODE=disabled: gate only)
+# then the stock-container consumer matrix and the Debian package test.
+#
+# --nexus-dry-run additionally runs `pqxx-sdk publish --dry-run` against $NEXUS_RAW_REPO
+# (read-only requests; default https://repo.valkyrianlabs.com/repository/cpp-sdk).
+# Output: release/rehearsal/libpqxx/release/dist/. Resource limits: docs/CI.md.
+set -euo pipefail
+repo=$(cd "$(dirname "$0")/.." && pwd)
+rehearsal="$repo/release/rehearsal/libpqxx"
+container_tests=true
+nexus_dry_run=false
+for arg in "$@"; do
+  case "$arg" in
+    --skip-container-tests) container_tests=false ;;
+    --nexus-dry-run) nexus_dry_run=true ;;
+    *) echo "usage: tools/release-rehearsal [--skip-container-tests] [--nexus-dry-run]" >&2; exit 2 ;;
+  esac
+done
+
+export PQXX_JOBS=${PQXX_JOBS:-4}
+export CI_CACHE_DIR=${CI_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/libpqxx-ci}
+export CI_CACHE_NAMES="ccache"
+export CI_MEMORY=${CI_MEMORY:-6g}
+
+rm -rf "$rehearsal"
+mkdir -p "$rehearsal"
+(cd "$repo" && git ls-files -z --cached --others --exclude-standard) |
+  (cd "$repo" && xargs -0 -I{} sh -c 'test -e "{}" -o -L "{}" && printf "%s\0" "{}"') |
+  rsync -a --from0 --files-from=- "$repo/" "$rehearsal/"
+# Reuse the verified upstream download (the build re-verifies it against the lock).
+if [ -d "$repo/release/build/downloads" ]; then
+  mkdir -p "$rehearsal/release/build" && cp -a "$repo/release/build/downloads" "$rehearsal/release/build/"
+fi
+cd "$rehearsal"
+git init -q -b main
+git add -A
+git -c user.name="Release Rehearsal" -c user.email=rehearsal@localhost.invalid commit -qm "release rehearsal"
+echo "rehearsal tree: $rehearsal ($(git ls-files | wc -l) files)"
+
+profile=ubuntu-24.04-amd64
+# shellcheck disable=SC2016 # expanded inside the container
+"$rehearsal/tools/ci-guard" -- "$rehearsal/ci/run-ci" bash -euo pipefail -c '
+  profile='"$profile"'
+  vlr check --release
+  python3 tools/pqxx-sdk check
+  python3 -m unittest discover -s tests/unit -t .
+  vlr prepare --record release/dist/meta/prepare.json
+  tests/pg-sandbox python3 tools/pqxx-sdk build --profile "$profile" --tests
+  vlr build-deb
+  base=$(python3 tools/pqxx-sdk version | python3 -c "import json,sys; print(json.load(sys.stdin)[\"profiles\"][\"$profile\"][\"archive\"])")
+  tests/pg-sandbox tests/sdk-test "release/dist/$base" --record "release/dist/${base%.tar.zst}.tests.json"
+  tests/fetch-test "release/dist/$base" --record release/build/metadata/fetch-test.json
+  tests/publish-test release/dist
+  python3 tools/pqxx-sdk inspect "release/dist/$base" --auto-sidecar --pinned-source
+  vlr checksums
+  vlr validate-artifacts
+  RELEASE_PUBLISH_MODE=disabled python3 tools/pqxx-sdk publish
+  vlr artifacts
+  vlr release-title
+'
+if $nexus_dry_run; then
+  NEXUS_RAW_REPO=${NEXUS_RAW_REPO:-https://repo.valkyrianlabs.com/repository/cpp-sdk} \
+    "$rehearsal/ci/run-ci" python3 tools/pqxx-sdk publish --dry-run || echo "rehearsal: Nexus dry run refused (see above)"
+fi
+if $container_tests; then
+  archive=$(cd release/dist && ls libpqxx-sdk-*-"$profile".tar.zst)
+  tests/containers/run "release/dist/$archive"
+  tests/deb-test release/dist
+fi
+echo "rehearsal: ok ($rehearsal/release/dist)"

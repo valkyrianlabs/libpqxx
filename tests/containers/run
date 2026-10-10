@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Consume an SDK archive inside stock Ubuntu containers (rootless Podman via ci/run-ci --image).
+#
+#   tests/containers/run ARCHIVE [CASE...]
+#
+# Cases (default: all of them):
+#   noble-clean          ubuntu:24.04, only g++-14, Meson, pkgconf, zstd, the libpq5 *runtime* and a
+#                        PostgreSQL server: no libpq-dev, no libpqxx of any kind
+#   noble-system-libpqxx ubuntu:24.04 with Ubuntu's own libpqxx-dev (and libpq-dev) installed: the
+#                        consumer must still use the SDK (tests/sdk-test proves which files linked)
+#   resolute             ubuntu:26.04 LTS with its default compiler (the next LTS)
+#   resolute-gcc14       ubuntu:26.04 LTS with g++-14 (the SDK's own compiler major)
+#   stonking             ubuntu:26.10 with its default compiler (interim release; informational)
+#
+# Each case runs tests/pg-sandbox tests/sdk-test as an unprivileged user and writes
+# release/build/metadata/containers/<case>.json. Images are referenced by tag; the record carries
+# the digest that was tested.
+set -euo pipefail
+
+[ "$#" -ge 1 ] || { sed -n '2,20p' "$0"; exit 2; }
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+archive="$(realpath "$1")"
+shift
+case "$archive" in "$root"/*) ;; *) echo "containers/run: the archive must be inside the repository" >&2; exit 2 ;; esac
+rel_archive="${archive#"$root"/}"
+cases=("$@")
+[ "${#cases[@]}" -gt 0 ] || cases=(noble-clean noble-system-libpqxx resolute resolute-gcc14 stonking)
+
+out="$root/release/build/metadata/containers"
+mkdir -p "$out"
+
+base_packages="ca-certificates python3 meson ninja-build pkgconf zstd binutils file libpq5"
+failed=()
+for case in "${cases[@]}"; do
+  case "$case" in
+    noble-clean) image=docker.io/library/ubuntu:24.04; cxx=g++-14; extra="g++-14 postgresql-16" ;;
+    noble-system-libpqxx) image=docker.io/library/ubuntu:24.04; cxx=g++-14; extra="g++-14 postgresql-16 libpqxx-dev libpq-dev" ;;
+    resolute) image=docker.io/library/ubuntu:26.04; cxx=g++; extra="g++ postgresql" ;;
+    resolute-gcc14) image=docker.io/library/ubuntu:26.04; cxx=g++-14; extra="g++-14 postgresql" ;;
+    stonking) image=docker.io/library/ubuntu:26.10; cxx=g++; extra="g++ postgresql" ;;
+    *) echo "containers/run: unknown case $case" >&2; exit 2 ;;
+  esac
+  echo "=== $case ($image, $cxx)"
+  podman pull -q "$image" >/dev/null
+  digest="$(podman image inspect "$image" --format '{{.Digest}}')"
+  status=0
+  # As container root: install, then run the test as an unprivileged user with the workspace
+  # owner's uid (initdb refuses root; the record is written into the workspace).
+  "$root/ci/run-ci" --image "$image" --root bash -euo pipefail -c '
+    export DEBIAN_FRONTEND=noninteractive
+    install -d /etc/postgresql-common && echo "create_main_cluster = false" > /etc/postgresql-common/createcluster.conf
+    apt-get update -qq >/dev/null
+    apt-get install -y -qq --no-install-recommends '"$base_packages $extra"' >/dev/null
+    uid=$(stat -c %u /workspace)
+    getent passwd "$uid" >/dev/null || useradd -u "$uid" -m tester
+    user=$(getent passwd "$uid" | cut -d: -f1)
+    . /etc/os-release
+    echo "$PRETTY_NAME; $('"$cxx"' --version | head -1); libpq5 $(dpkg-query -W -f="\${Version}" libpq5)"
+    dpkg-query -W -f="\${Package} \${Version}\n" "libpqxx*" 2>/dev/null | sed "s/^/installed: /" || true
+    runuser -u "$user" -- env HOME=/tmp CXX='"$cxx"' tests/pg-sandbox tests/sdk-test "'"$rel_archive"'" \
+      --cxx '"$cxx"' --record "release/build/metadata/containers/'"$case"'.json"
+  ' || status=$?
+  if [ -f "$out/$case.json" ]; then
+    python3 - "$out/$case.json" "$image" "$digest" "$case" <<'EOF'
+import json, sys
+path, image, digest, case = sys.argv[1:]
+record = json.load(open(path))
+record.update({"case": case, "image": image, "image_digest": digest})
+json.dump(record, open(path, "w"), indent=2)
+EOF
+  fi
+  if [ "$status" -ne 0 ]; then failed+=("$case"); echo "=== $case: FAILED ($status)"; else echo "=== $case: passed"; fi
+done
+
+if [ "${#failed[@]}" -gt 0 ]; then
+  echo "containers/run: failed: ${failed[*]}" >&2
+  exit 1
+fi
+echo "containers/run: all cases passed: ${cases[*]}"

@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""End-to-end verification of one SDK archive, as a consumer sees it.
+
+    tests/pg-sandbox tests/sdk-test ARCHIVE [--record FILE] [--std 23,20] [--cxx g++-14] [--no-db]
+
+ 1. inspect the archive (layout, every file's sha256, headers, pkg-config) and its sidecar
+ 2. serve it from a local Nexus-shaped HTTP server and acquire it with tools/libpqxx-sdk-fetch into
+    a fresh cache outside the repository (pinned sha256, manifest checks)
+ 3. pkg-config with *only* the SDK's private directory; relocation to a second directory
+ 4. build tests/consumer with native Meson for each C++ standard (+ a unity build)
+ 5. provenance: every libpqxx header came from the SDK (ninja deps), every libpqxx archive member
+    from the SDK's libpqxx.a (linker map), no libpqxx*.so anywhere, libpq.so.5 dynamic from the
+    system, no libpq objects linked statically, strong pqxx symbols all defined by the SDK archive
+ 6. symbol version requirements of the executables vs the profile baseline
+ 7. run the consumer against PostgreSQL (tests/pg-sandbox), unless --no-db
+ 8. note any system libpqxx installation and prove it was not used
+
+Writes a JSON record (result + archive sha256); `pqxx-sdk publish` requires a passing record.
+"""
+
+from __future__ import annotations
+
+import argparse
+import functools
+import http.server
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "tools"))
+from pqxxsdk.inspect import inspect  # noqa: E402
+
+checks: list[dict] = []
+
+
+class TestFailure(Exception):
+    pass
+
+
+def check(name: str, ok: bool, detail: str = "") -> None:
+    checks.append({"check": name, "ok": bool(ok), "detail": detail})
+    print(f"  {'ok  ' if ok else 'FAIL'} {name}{(': ' + detail) if detail else ''}", flush=True)
+    if not ok:
+        raise TestFailure(f"{name}: {detail}")
+
+
+def sh(cmd: list, **kwargs) -> str:
+    result = subprocess.run([str(c) for c in cmd], text=True, capture_output=True, **kwargs)
+    if result.returncode != 0:
+        raise TestFailure(f"{' '.join(map(str, cmd))} failed ({result.returncode}):\n{result.stdout[-4000:]}\n{result.stderr[-4000:]}")
+    return result.stdout
+
+
+def section(title: str) -> None:
+    print(f"\n== {title}", flush=True)
+
+
+# --- acquisition through a local Nexus-shaped server -------------------------------------------
+
+
+class Server:
+    def __init__(self, root: Path):
+        handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(root))
+        handler.log_message = lambda *a, **k: None  # type: ignore[attr-defined]
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self.httpd.shutdown()
+
+
+def stage_remote(root: Path, archive: Path, manifest: dict, sha: str) -> None:
+    remote = root / "libpqxx" / manifest["sdk_version"] / manifest["profile"]
+    remote.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(archive, remote / "libpqxx-sdk.tar.zst")
+    (remote / "libpqxx-sdk.tar.zst.sha256").write_text(f"{sha}  libpqxx-sdk.tar.zst\n")
+
+
+def write_pin(path: Path, manifest: dict, sha: str, base: str) -> None:
+    path.write_text(f'sdk_version = "{manifest["sdk_version"]}"\nprofile = "{manifest["profile"]}"\n'
+                    f'sha256 = "{sha}"\nbase_url = "{base}"\n')
+
+
+def fetch(pin: Path, cache: Path, *extra: str) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, "-I", str(REPO / "tools" / "libpqxx-sdk-fetch"), "--pin", str(pin),
+                           "--cache-dir", str(cache), "--format", "json", *extra], text=True, capture_output=True)
+
+
+# --- linkage analysis --------------------------------------------------------------------------
+
+
+def parse_map(path: Path) -> tuple[set[str], list[str], list[str]]:
+    """(archives that contributed members, LOADed files, archive member lines)."""
+    text = path.read_text(errors="replace")
+    archives, members = set(), []
+    block = text.split("Archive member included to satisfy reference by file (symbol)", 1)
+    if len(block) == 2:
+        for line in block[1].splitlines():
+            if line.startswith(("Discarded input sections", "Memory Configuration", "Allocating common")):
+                break
+            m = re.match(r"^(/\S+?\.a)\((\S+?)\)", line)
+            if m:
+                archives.add(m.group(1))
+                members.append(f"{Path(m.group(1)).name}({m.group(2)})")
+    loads = re.findall(r"^LOAD (\S+)", text, re.MULTILINE)
+    return archives, loads, members
+
+
+def strong_pqxx_symbols(path: Path) -> set[str]:
+    out = sh(["nm", "--defined-only", path])
+    return {line.split()[-1] for line in out.splitlines()
+            if len(line.split()) == 3 and line.split()[1] == "T" and "4pqxx" in line.split()[2]}
+
+
+def max_versions(binary: Path) -> dict[str, str]:
+    best: dict[str, tuple] = {}
+    for prefix, ver in re.findall(r"\b(GLIBCXX|GLIBC|CXXABI)_([0-9][0-9.]*)\b", sh(["objdump", "-T", binary])):
+        key = tuple(int(p) for p in ver.split(".") if p)
+        if key > best.get(prefix, ()):
+            best[prefix] = key
+    return {k: ".".join(map(str, v)) for k, v in best.items()}
+
+
+def vtuple(text: str) -> tuple[int, ...]:
+    return tuple(int(p) for p in re.findall(r"\d+", text))
+
+
+def verify_variant(name: str, build: Path, sdk_root: Path, manifest: dict, run_db: bool) -> dict:
+    exe = build / "consumer"
+    sdk_lib = (sdk_root / "lib" / "libpqxx.a").resolve()
+    sdk_inc = (sdk_root / "include").resolve()
+
+    # Headers: ninja's dependency records for every consumer object.
+    deps = sh(["ninja", "-C", build, "-t", "deps"])
+    pqxx_headers = {os.path.realpath(h.strip()) for h in deps.splitlines()
+                    if re.search(r"/pqxx/", h) and h.startswith("    ")}
+    foreign = sorted(h for h in pqxx_headers if not h.startswith(str(sdk_inc) + "/"))
+    check(f"{name}: all {len(pqxx_headers)} libpqxx headers came from the SDK", pqxx_headers and not foreign,
+          ", ".join(foreign[:3]))
+
+    # Link line as Meson generated it.
+    commands = sh(["ninja", "-C", build, "-t", "commands", "consumer"]).strip().splitlines()[-1]
+    check(f"{name}: link line names the SDK archive by path",
+          any(os.path.realpath(tok) == str(sdk_lib) for tok in commands.split()), "")
+    check(f"{name}: link line binds libpq by SONAME and has no -lpqxx/-lpq",
+          "-l:libpq.so.5" in commands.split() and not re.search(r"\s-l(pqxx|pq)(\s|$)", commands), "")
+
+    # Linker map: what actually satisfied references.
+    archives, loads, members = parse_map(build / "consumer.map")
+    pqxx_archives = {os.path.realpath(a) for a in archives if "pqxx" in Path(a).name}
+    sdk_members = [m for m in members if m.startswith("libpqxx.a(")]
+    check(f"{name}: libpqxx archive members linked only from the SDK ({len(sdk_members)} members)",
+          pqxx_archives == {str(sdk_lib)} and len(sdk_members) > 0, ", ".join(sorted(pqxx_archives - {str(sdk_lib)})))
+    pqxx_shared = [l for l in loads if "libpqxx" in Path(l).name and ".so" in Path(l).name]
+    check(f"{name}: no libpqxx shared library loaded", not pqxx_shared, ", ".join(pqxx_shared))
+    libpq_loads = [l for l in loads if Path(l).name.startswith("libpq.")]
+    check(f"{name}: libpq loaded as the shared libpq.so.5",
+          len(libpq_loads) == 1 and libpq_loads[0].endswith("libpq.so.5") and
+          not any("libpq.a" in a or "libpgcommon" in a or "libpgport" in a for a in archives),
+          ", ".join(os.path.realpath(l) for l in libpq_loads))
+
+    # ELF dynamic section and symbols.
+    needed = re.findall(r"\(NEEDED\)\s+Shared library: \[([^\]]+)\]", sh(["readelf", "-d", exe]))
+    check(f"{name}: DT_NEEDED has libpq.so.5 and no libpqxx", "libpq.so.5" in needed and
+          not any(n.startswith("libpqxx") for n in needed), " ".join(needed))
+    ldd = sh(["ldd", exe])
+    libpq_line = next((l.strip() for l in ldd.splitlines() if l.strip().startswith("libpq.so.5")), "")
+    check(f"{name}: libpq.so.5 resolves to the system library", "=> /usr/lib/" in libpq_line or "=> /lib/" in libpq_line,
+          libpq_line)
+    check(f"{name}: every shared library resolves", "not found" not in ldd, "")
+    defined_pq = [l for l in sh(["nm", "--defined-only", exe]).splitlines() if re.search(r" [TtW] PQ\w+$", l)]
+    check(f"{name}: no libpq code linked statically", not defined_pq, "; ".join(defined_pq[:3]))
+    dyn_undef = sh(["nm", "-D", "--undefined-only", exe])
+    check(f"{name}: libpq functions are dynamic imports", "PQconnectdbParams" in dyn_undef or "PQconnectStart" in dyn_undef
+          or "PQconnectdb" in dyn_undef, "")
+
+    exe_syms = strong_pqxx_symbols(exe)
+    own = set()
+    for obj in build.rglob("*.o"):
+        own |= strong_pqxx_symbols(obj)
+    lib_syms = {line.split()[-1] for line in sh(["nm", "--defined-only", sdk_lib]).splitlines()
+                if len(line.split()) >= 2 and line.split()[-2] in ("T", "W", "t")}
+    stray = sorted(exe_syms - own - lib_syms)
+    check(f"{name}: {len(exe_syms - own)} strong pqxx symbols all defined by the SDK archive", not stray,
+          ", ".join(stray[:3]))
+
+    versions = max_versions(exe)
+    baseline = manifest["target"]["glibc"]
+    check(f"{name}: requires GLIBC {versions.get('GLIBC')} <= profile baseline {baseline}",
+          vtuple(versions.get("GLIBC", "0")) <= vtuple(baseline), "")
+
+    out = sh([exe, "--version-only"])
+    check(f"{name}: runs and reports headers {manifest['upstream']['version']}",
+          f"libpqxx headers {manifest['upstream']['version']}" in out, out.strip())
+    if run_db:
+        result = subprocess.run([exe], text=True, capture_output=True)
+        print(result.stdout.rstrip())
+        check(f"{name}: PostgreSQL queries against a disposable server", result.returncode == 0,
+              (result.stderr or "").strip()[-500:])
+    return {"variant": name, "needed": needed, "symbol_versions": versions, "sdk_members_linked": len(sdk_members),
+            "libpq": libpq_line}
+
+
+def system_libpqxx() -> dict | None:
+    env = {k: v for k, v in os.environ.items() if k not in ("PKG_CONFIG_PATH", "PKG_CONFIG_LIBDIR")}
+    result = subprocess.run(["pkg-config", "--modversion", "libpqxx"], text=True, capture_output=True, env=env)
+    if result.returncode != 0:
+        return None
+    libs = subprocess.run(["pkg-config", "--libs", "libpqxx"], text=True, capture_output=True, env=env).stdout.strip()
+    pkg = subprocess.run(["dpkg-query", "-S", "/usr/include/pqxx/pqxx"], text=True, capture_output=True).stdout.strip()
+    return {"version": result.stdout.strip(), "libs": libs, "package": pkg.split(":")[0] if pkg else None}
+
+
+def acquire_archive(archive: Path, sidecar: Path, work: Path, record: dict) -> tuple[Path, Path, dict, "Server"]:
+    """Steps 1-3 for an archive: inspect, acquire through the fetch script, pkg-config checks."""
+    section("1. inspect archive")
+    report = inspect(archive, sidecar=sidecar if sidecar.is_file() else None)
+    record["archive_sha256"] = report["sha256"]
+    check("archive layout, file digests, headers, pkg-config and sidecar", True,
+          f"{report['files']} files, {report['headers']} headers")
+    if not sidecar.is_file():
+        raise TestFailure("sidecar manifest missing")
+    manifest = json.loads(sidecar.read_text())
+    manifest.pop("archive", None)
+
+    section("2. acquire through libpqxx-sdk-fetch from a local Nexus-shaped server")
+    remote = work / "nexus"
+    stage_remote(remote, archive, manifest, report["sha256"])
+    server = Server(remote)
+    pin = work / "libpqxx-sdk.toml"
+    write_pin(pin, manifest, report["sha256"], server.url)
+    result = fetch(pin, work / "consumer-cache")
+    check("download, checksum, extraction, manifest and host compatibility", result.returncode == 0,
+          result.stderr.strip()[-600:])
+    acquired = json.loads(result.stdout)
+    pc_dir = Path(acquired["pkg_config_path"])
+    sdk_root = Path(acquired["sdk"])
+    check("SDK extracted outside the repository", not str(sdk_root).startswith(str(REPO)), str(sdk_root))
+
+    section("3. pkg-config with only the SDK's private metadata")
+    env = dict(os.environ, PKG_CONFIG_LIBDIR=str(pc_dir))
+    env.pop("PKG_CONFIG_PATH", None)
+    version = sh(["pkg-config", "--modversion", "libpqxx-vh"], env=env).strip()
+    check("libpqxx-vh resolves", version == manifest["upstream"]["version"], version)
+    libs = [os.path.normpath(t) if t.startswith("/") else t
+            for t in sh(["pkg-config", "--static", "--libs", "libpqxx-vh"], env=env).split()]
+    check("--static --libs = SDK archive + libpq SONAME",
+          libs == [str(sdk_root / "lib" / "libpqxx.a"), "-l:libpq.so.5"], " ".join(libs))
+    cflags = [os.path.normpath(t[2:]) for t in sh(["pkg-config", "--cflags", "libpqxx-vh"], env=env).split()]
+    check("--cflags = SDK include directory", cflags == [str(sdk_root / "include")], " ".join(cflags))
+    moved = work / "relocated" / "deeper" / sdk_root.name
+    shutil.copytree(sdk_root, moved)
+    env_moved = dict(env, PKG_CONFIG_LIBDIR=str(moved / "lib" / "pkgconfig"))
+    libs_moved = os.path.normpath(sh(["pkg-config", "--libs", "libpqxx-vh"], env=env_moved).split()[0])
+    check("relocated copy resolves to its own location", libs_moved == str(moved / "lib" / "libpqxx.a"), libs_moved)
+    pc_text = (sdk_root / "lib" / "pkgconfig" / "libpqxx-vh.pc").read_text()
+    check("no build-machine paths in the .pc", "/release/build" not in pc_text and "/workspace" not in pc_text, "")
+    return sdk_root, pc_dir, manifest, server
+
+
+def installed_sdk(root: Path) -> dict:
+    """Steps 1-3 for an installed tree (the Debian package): digests, default pkg-config path."""
+    section("1-3. installed SDK through the default pkg-config search path")
+    manifest = json.loads((root / "manifest.json").read_text())
+    import hashlib
+    bad = [rel for rel, digest in manifest["files"].items()
+           if hashlib.sha256((root / rel).read_bytes()).hexdigest() != digest]
+    check(f"installed files match manifest.json ({len(manifest['files'])} files)", not bad, ", ".join(bad[:3]))
+    version = sh(["pkg-config", "--modversion", "libpqxx-vh"]).strip()
+    check("libpqxx-vh resolves from the system pkg-config path", version == manifest["upstream"]["version"], version)
+    libs = [os.path.normpath(t) if t.startswith("/") else t for t in sh(["pkg-config", "--static", "--libs", "libpqxx-vh"]).split()]
+    check("--static --libs = installed SDK archive + libpq SONAME",
+          libs == [str(root / "lib" / "libpqxx.a"), "-l:libpq.so.5"], " ".join(libs))
+    return manifest
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("archive", type=Path, nargs="?")
+    parser.add_argument("--installed", type=Path, help="test an installed SDK tree (the Debian package) through "
+                        "the default pkg-config search path instead of acquiring ARCHIVE")
+    parser.add_argument("--record", type=Path)
+    parser.add_argument("--std", default="23,20")
+    parser.add_argument("--cxx", default=os.environ.get("CXX", "c++"))
+    parser.add_argument("--no-db", action="store_true", help="skip the PostgreSQL round trips")
+    parser.add_argument("--no-unity", action="store_true")
+    parser.add_argument("--keep", action="store_true", help="keep the temporary directory")
+    args = parser.parse_args()
+    if bool(args.archive) == bool(args.installed):
+        parser.error("give either ARCHIVE or --installed ROOT")
+
+    run_db = not args.no_db
+    if run_db and not (os.environ.get("PGHOST") or os.environ.get("PGDATABASE")):
+        print("sdk-test: no PostgreSQL in the environment; run under tests/pg-sandbox or pass --no-db", file=sys.stderr)
+        return 2
+
+    work = Path(tempfile.mkdtemp(prefix="libpqxx-sdk-test-"))
+    record: dict = {"result": "failed", "archive": args.archive.name if args.archive else None,
+                    "archive_sha256": None, "installed": str(args.installed) if args.installed else None}
+    started = time.monotonic()
+    server = None
+    try:
+        if args.installed:
+            sdk_root, pc_dir = args.installed.resolve(), None
+            manifest = installed_sdk(sdk_root)
+        else:
+            archive = args.archive.resolve()
+            sidecar = archive.with_name(archive.name.removesuffix(".tar.zst") + ".manifest.json")
+            sdk_root, pc_dir, manifest, server = acquire_archive(archive, sidecar, work, record)
+
+        system = system_libpqxx()
+        record["system_libpqxx"] = system
+        if system:
+            print(f"   system libpqxx {system['version']} is installed ({system['package']}, {system['libs']})")
+
+        section("4-7. Meson consumers: build, provenance, symbol versions, PostgreSQL")
+        variants = []
+        stds = [s.strip() for s in args.std.split(",") if s.strip()]
+        plan = [(f"c++{s}", s, False) for s in stds] + ([] if args.no_unity else [(f"c++{stds[0]}-unity", stds[0], True)])
+        compiler = sh([args.cxx, "--version"]).splitlines()[0]
+        print(f"   compiler: {compiler}; meson {sh(['meson', '--version']).strip()}")
+        for name, std, unity in plan:
+            build = work / f"build-{name}"
+            setup = ["meson", "setup", build, REPO / "tests" / "consumer", f"-Dcpp_std=c++{std}"]
+            setup += (["-Dunity=on"] if unity else []) + ([f"-Dpkg_config_path={pc_dir}"] if pc_dir else [])
+            sh(setup, env=dict(os.environ, CXX=args.cxx))
+            sh(["meson", "compile", "-C", build])
+            check(f"{name}: configured with native Meson and compiled", (build / "consumer").is_file(), "")
+            variants.append(verify_variant(name, build, sdk_root, manifest, run_db))
+        record["variants"] = variants
+
+        if system:
+            section("8. coexistence with the system libpqxx")
+            check(f"system libpqxx {system['version']} present but unused (see provenance checks above)",
+                  all(v["sdk_members_linked"] > 0 for v in variants), "")
+
+        record.update({"result": "passed", "sdk_version": manifest["sdk_version"], "profile": manifest["profile"],
+                       "compiler": compiler, "host": {"os": platform.freedesktop_os_release().get("PRETTY_NAME"),
+                                                      "glibc": platform.libc_ver()[1], "machine": platform.machine()},
+                       "database": "postgresql (tests/pg-sandbox)" if run_db else None})
+        print(f"\nsdk-test: PASSED ({len(checks)} checks, {time.monotonic() - started:.0f}s)")
+        return 0
+    except TestFailure as exc:
+        print(f"\nsdk-test: FAILED: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if server:
+            server.close()
+        record["checks"] = checks
+        record["seconds"] = round(time.monotonic() - started)
+        if args.record:
+            args.record.parent.mkdir(parents=True, exist_ok=True)
+            args.record.write_text(json.dumps(record, indent=2) + "\n")
+        if args.keep:
+            print(f"kept {work}")
+        else:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

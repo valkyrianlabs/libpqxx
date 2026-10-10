@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "upstream": {
+    "repository": "https://github.com/jtv/libpqxx",
+    "version": "8.0.2",
+    "tag": "8.0.2",
+    "release_name": "libpqxx 8.0.2: Small fixes",
+    "release_url": "https://github.com/jtv/libpqxx/releases/tag/8.0.2",
+    "published_at": "2026-07-18T17:48:27Z",
+    "commit": "92e7d64a3ee91abcecbd5182096a8d8d36de12c0",
+    "tree": "00076d65a44360ce4daf16e4a2fe24b653734fbf",
+    "commit_date": "2026-07-18T16:47:15Z",
+    "commit_epoch": 1784393235,
+    "archive": {
+      "url": "https://github.com/jtv/libpqxx/archive/refs/tags/8.0.2.tar.gz",
+      "sha256": "028c5fba4982e759fe182af1103ccd08b02bb4e1f9f12a551e01d21cac0c4440",
+      "size": 838657,
+      "top_dir": "libpqxx-8.0.2",
+      "format": "tar.gz (GitHub tag archive; git-archive pax header carries the commit id)"
+    },
+    "license": {
+      "spdx": "BSD-3-Clause",
+      "file": "COPYING"
+    }
+  }
+}

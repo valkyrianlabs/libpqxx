@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Test the optional libpqxx-vh-dev package in a stock ubuntu:24.04 container, side by side with
+# Ubuntu's own libpqxx-dev.
+#
+#   tests/deb-test DIST_DIR
+#
+#  - installs Ubuntu's libpqxx-dev first, then libpqxx-vh-dev with apt (dependency resolution, no
+#    file conflicts), and checks the package declares no Provides/Conflicts/Replaces
+#  - tests/sdk-test --installed: files match manifest.json, pkg-config libpqxx-vh from the default
+#    search path, Meson consumers (C++23/C++20/unity) linked from the packaged archive with the
+#    system libpq, PostgreSQL round trips
+#  - the packaged SDK tree equals the SDK archive in DIST_DIR, byte for byte
+#  - dpkg --verify for both packages; removal leaves Ubuntu's libpqxx-dev intact
+# Writes release/build/metadata/deb-test.json.
+set -euo pipefail
+[ "$#" -eq 1 ] || { sed -n '2,15p' "$0"; exit 2; }
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+dist="$(realpath "$1")"
+case "$dist" in "$root"/*) ;; *) echo "deb-test: DIST_DIR must be inside the repository" >&2; exit 2 ;; esac
+rel="${dist#"$root"/}"
+deb="$(cd "$dist" && ls libpqxx-vh-dev_*_amd64.deb)"
+archive="$(cd "$dist" && ls libpqxx-sdk-*-ubuntu-24.04-amd64.tar.zst)"
+mkdir -p "$root/release/build/metadata"
+
+"$root/ci/run-ci" --image docker.io/library/ubuntu:24.04 --root bash -euo pipefail -c '
+  export DEBIAN_FRONTEND=noninteractive
+  install -d /etc/postgresql-common && echo "create_main_cluster = false" > /etc/postgresql-common/createcluster.conf
+  apt-get update -qq >/dev/null
+  apt-get install -y -qq --no-install-recommends ca-certificates python3 meson ninja-build pkgconf zstd binutils file \
+    g++-14 postgresql-16 libpqxx-dev >/dev/null
+  echo "Ubuntu libpqxx: $(dpkg-query -W -f="\${Package} \${Version}" libpqxx-dev)"
+  apt-get install -y -qq --no-install-recommends ./'"$rel/$deb"' >/dev/null
+  echo "installed: $(dpkg-query -W -f="\${Package} \${Version} depends: \${Depends}" libpqxx-vh-dev)"
+  for field in Provides Conflicts Replaces Breaks; do
+    value=$(dpkg-query -W -f="\${$field}" libpqxx-vh-dev)
+    [ -z "$value" ] || { echo "FAIL: libpqxx-vh-dev declares $field: $value"; exit 1; }
+  done
+  echo "ok   no Provides/Conflicts/Replaces/Breaks"
+  echo "ok   both installed: pkg-config libpqxx $(pkg-config --modversion libpqxx), libpqxx-vh $(pkg-config --modversion libpqxx-vh)"
+  dpkg -L libpqxx-vh-dev | grep -E "^/usr/(include|lib/x86_64-linux-gnu/libpqxx[^-])" && { echo "FAIL: files in shared namespaces"; exit 1; }
+  echo "ok   all files below /usr/lib/x86_64-linux-gnu/libpqxx-vh, plus pkgconfig/libpqxx-vh.pc and docs"
+
+  # Packaged tree == SDK archive contents.
+  tmp=$(mktemp -d)
+  zstd -dc '"$rel/$archive"' | tar -x -C "$tmp"
+  diff -r "$tmp"/libpqxx-sdk-*/ /usr/lib/x86_64-linux-gnu/libpqxx-vh/ && echo "ok   packaged tree is byte-identical to '"$archive"'"
+  # Stock images exclude /usr/share/doc from installation (dpkg path-exclude); anything else counts.
+  problems=$(dpkg --verify libpqxx-vh-dev libpqxx-dev | grep -v " /usr/share/doc/" || true)
+  [ -z "$problems" ] || { echo "FAIL: dpkg --verify: $problems"; exit 1; }
+  echo "ok   dpkg --verify (outside /usr/share/doc, which the stock image excludes)"
+
+  uid=$(stat -c %u /workspace)
+  getent passwd "$uid" >/dev/null || useradd -u "$uid" -m tester
+  user=$(getent passwd "$uid" | cut -d: -f1)
+  runuser -u "$user" -- env HOME=/tmp tests/pg-sandbox tests/sdk-test --installed /usr/lib/x86_64-linux-gnu/libpqxx-vh \
+    --cxx g++-14 --record release/build/metadata/deb-test.json
+
+  apt-get remove -y -qq libpqxx-vh-dev >/dev/null
+  [ ! -e /usr/lib/x86_64-linux-gnu/libpqxx-vh ] && ! pkg-config --exists libpqxx-vh && echo "ok   removed cleanly"
+  problems=$(dpkg --verify libpqxx-dev | grep -v " /usr/share/doc/" || true)
+  [ -z "$problems" ] && [ -f /usr/include/pqxx/pqxx ] && echo "ok   Ubuntu libpqxx-dev intact after removal"
+'
+echo "deb-test: PASSED"

@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# Adopt a newer upstream libpqxx release as a candidate and write a review report.
+#
+#   tools/upstream-candidate [VERSION]      (default: the newest stable GitHub release)
+#
+# Run inside ./ci/run-ci (the upstream.yml workflow does). Changes the work tree only:
+#   upstream.lock.json   pinned tag, commit, tree, archive sha256 (tools/pqxx-sdk pin)
+#   VERSION              <upstream>-1 (vlr version upstream)
+#   .release/*_NEXT.md   a changelog bullet; release notes if none are staged
+# then builds the SDK with upstream's tests, runs the consumer and acquisition tests, and writes
+# release/build/upstream-candidate/report.md (also used as the pull request body), including the
+# diff of upstream's build files and stated requirements since the previously pinned release.
+# Nothing is committed or published.
+set -euo pipefail
+repo=$(cd "$(dirname "$0")/.." && pwd)
+cd "$repo"
+out=release/build/upstream-candidate
+mkdir -p "$out"
+report="$out/report.md"
+
+old_version=$(python3 -c 'import json; print(json.load(open("upstream.lock.json"))["upstream"]["version"])')
+old_tag=$(python3 -c 'import json; print(json.load(open("upstream.lock.json"))["upstream"]["tag"])')
+python3 tools/pqxx-sdk fetch-source >/dev/null  # verified old source for the build-file diff
+old_src=$(mktemp -d)
+cp -a "release/build/source/libpqxx-$old_version/." "$old_src/"
+
+python3 tools/pqxx-sdk pin ${1:+"$1"}
+new_version=$(python3 -c 'import json; print(json.load(open("upstream.lock.json"))["upstream"]["version"])')
+if [ "$new_version" = "$old_version" ]; then
+  echo "upstream-candidate: libpqxx $new_version is already pinned" >&2
+  exit 0
+fi
+release="$new_version-1"
+vlr version upstream "$new_version"
+commit=$(python3 -c 'import json; print(json.load(open("upstream.lock.json"))["upstream"]["commit"])')
+url=$(python3 -c 'import json; print(json.load(open("upstream.lock.json"))["upstream"]["release_url"])')
+
+printf -- '- Update libpqxx to %s (tag %s, commit %s).\n' "$new_version" "$new_version" "${commit:0:12}" >> .release/CHANGELOG_NEXT.md
+if ! grep -q '^# ' .release/RELEASE_NOTES_NEXT.md; then
+  cat > .release/RELEASE_NOTES_NEXT.md <<EOF
+# libpqxx $new_version static SDK
+
+The SDK now packages upstream libpqxx **$new_version** (commit \`${commit:0:12}\`); see the upstream
+release notes at $url. Nexus Raw path: \`libpqxx/$new_version-1/<profile>/libpqxx-sdk.tar.zst\`.
+EOF
+fi
+python3 tools/pqxx-sdk check
+
+status=passed
+log="$out/build.log"
+{
+  tests/pg-sandbox python3 tools/pqxx-sdk build --profile ubuntu-24.04-amd64 --tests &&
+  archive=$(ls release/build/sdk/dist/libpqxx-sdk-"$new_version"-1-ubuntu-24.04-amd64.tar.zst) &&
+  python3 tools/pqxx-sdk inspect "$archive" --auto-sidecar --pinned-source &&
+  tests/pg-sandbox tests/sdk-test "$archive" &&
+  tests/fetch-test "$archive"
+} >"$log" 2>&1 || status=failed
+
+new_src="release/build/source/libpqxx-$new_version"
+build_diff=$(diff -ru "$old_src" "$new_src" --unidirectional-new-file \
+  -x '*.cxx' -x '*.hxx' -x 'doc' -x 'test' -x 'examples' -x '*.md' -x 'configure' -x '*.in' -x '*.m4' -x '*.am' \
+  -x 'config' -x 'tools' -x 'ChangeLog' -x 'NEWS' -x 'VERSION' -x '.*' -x '*.yml' 2>/dev/null | head -400 || true)
+requirements=$(diff -u "$old_src/requirements.json" "$new_src/requirements.json" 2>/dev/null || true)
+news=$(awk -v v="$new_version" 'NR==1,0 { if ($0 ~ "^"v) p=1; else if (p && $0 ~ /^[0-9]+\.[0-9]+\.[0-9]+/) exit; if (p) print }' "$new_src/NEWS" | head -60)
+rm -rf "$old_src"
+
+{
+  echo "## libpqxx $old_version → $new_version"
+  echo
+  echo "| | |"
+  echo "|---|---|"
+  echo "| Upstream release | $url |"
+  echo "| Tag / commit | \`$new_version\` / \`$commit\` |"
+  echo "| Archive sha256 | \`$(python3 -c 'import json; print(json.load(open("upstream.lock.json"))["upstream"]["archive"]["sha256"])')\` |"
+  echo "| VERSION | \`$release\` (SDK \`$new_version-1\`) |"
+  echo "| Candidate build + upstream tests + consumer/acquisition tests | **$status** |"
+  echo
+  echo "### Upstream NEWS"
+  echo
+  echo '```'
+  echo "${news:-(no NEWS entry found)}"
+  echo '```'
+  echo
+  echo "### Upstream build-system and requirement changes since $old_tag"
+  echo
+  echo "Review these before merging: new or changed CMake options, flags, install rules or minimum"
+  echo "versions may need profile or tooling changes (docs/MAINTENANCE.md)."
+  echo
+  echo '```diff'
+  echo "${requirements:-requirements.json unchanged}"
+  echo "${build_diff:-(no build-system file changes)}"
+  echo '```'
+  echo
+  echo "### Before merging"
+  echo
+  echo "- [ ] Build-system changes above reviewed; profile/cmake_args still correct"
+  echo "- [ ] \`.release/*_NEXT.md\` describe the release"
+  echo "- [ ] Release CI dry run (\`release.yml\`, publish: dry-run) green, including the container matrix"
+  echo
+  echo "<details><summary>Build and test log (tail)</summary>"
+  echo
+  echo '```'
+  tail -60 "$log"
+  echo '```'
+  echo "</details>"
+} > "$report"
+echo "upstream-candidate: $status; report: $report"
+[ "$status" = passed ]

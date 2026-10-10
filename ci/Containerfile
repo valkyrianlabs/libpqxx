@@ -1,0 +1,53 @@
+# Build/test environment for the Vaulthalla libpqxx SDK: upstream libpqxx's CMake + Ninja build,
+# the Meson consumer tests against a throwaway PostgreSQL, and the optional Debian package build.
+# Built and run by ci/run-ci (rootless Podman); nothing here touches the host, and steps may sudo
+# freely inside the container.
+#
+# This image *is* the ubuntu-24.04-amd64 build profile (profiles/ubuntu-24.04-amd64.toml): same
+# base image digest, g++ 14 as the default cc/c++ (the toolchain Vaulthalla's CI uses), the
+# distribution's libpq-dev. `tools/pqxx-sdk build` refuses to run where the profile does not match.
+#
+# Packages: compiler + CMake/Ninja (the SDK build), Meson/pkgconf (consumer tests), postgresql-16
+# (disposable test clusters; no cluster is created at install time), Debian packaging tools
+# (optional libpqxx-vh-dev), gh (vlr github-release, upstream pull requests) and vl-release.
+FROM docker.io/library/ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
+
+# Newest vl-release / pmdocs in the ValkyrianLabs APT index when ci/run-ci built the image; part
+# of the image tag, so a new tool release rebuilds the image.
+ARG VALKYRIANLABS_TOOLS=""
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CCACHE_DIR=/cache/ccache \
+    CCACHE_MAXSIZE=2G \
+    HOME=/home/ci \
+    CI=true
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
+ && install -d -m 0755 /etc/apt/keyrings \
+ && curl -fsSL https://apt.valkyrianlabs.com/pubkey.gpg -o /etc/apt/keyrings/valkyrianlabs.gpg \
+ && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli.gpg \
+ && chmod 0644 /etc/apt/keyrings/*.gpg \
+ && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/valkyrianlabs.gpg] https://apt.valkyrianlabs.com stable main" > /etc/apt/sources.list.d/valkyrianlabs.list \
+ && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/githubcli.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list \
+ && install -d /etc/postgresql-common \
+ && echo "create_main_cluster = false" > /etc/postgresql-common/createcluster.conf \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      sudo git jq xz-utils zstd file python3 ccache binutils \
+      gcc-14 g++-14 build-essential cmake ninja-build meson pkgconf \
+      libpq-dev postgresql-16 \
+      debhelper dpkg-dev fakeroot lintian \
+      gh vl-release \
+ && echo 'ALL ALL=(ALL:ALL) NOPASSWD: ALL' > /etc/sudoers.d/ci \
+ && chmod 0440 /etc/sudoers.d/ci \
+ && rm -rf /var/lib/apt/lists/* \
+ && echo "tools: ${VALKYRIANLABS_TOOLS}" && vlr --version \
+ && update-alternatives --install /usr/bin/cc cc /usr/bin/gcc-14 100 \
+ && update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-14 100 \
+ && c++ --version | head -1
+
+# HOME for whichever host uid ci/run-ci maps in (--userns=keep-id).
+RUN install -d -m 1777 /home/ci
+
+WORKDIR /workspace

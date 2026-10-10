@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""Acquire a pinned libpqxx static SDK and print the pkg-config directory for Meson.
+
+    libpqxx-sdk-fetch --pin deps/libpqxx-sdk.toml [--cache-dir DIR] [--format path|env|meson]
+    libpqxx-sdk-fetch --make-pin SDK_VERSION PROFILE --base-url URL   (prints a pin, for updates)
+
+Standalone (Python >= 3.11 standard library, plus the `zstd` program); copy it into a consumer
+repository unchanged. It runs *before* `meson setup`; compilation itself never touches the network.
+
+The pin file (TOML, tracked in the consumer repository) names exactly one artifact:
+
+    sdk_version = "8.0.2-1"                 # <upstream libpqxx>-<SDK revision>
+    profile     = "ubuntu-24.04-amd64"
+    sha256      = "<sha256 of libpqxx-sdk.tar.zst>"
+    base_url    = "https://repo.valkyrianlabs.com/repository/cpp-sdk"
+
+Behaviour:
+- the artifact is <base_url>/libpqxx/<sdk_version>/<profile>/libpqxx-sdk.tar.zst; nothing newer is
+  ever resolved implicitly.
+- cache: <cache>/<sdk_version>-<profile>-<sha256[:16]>/ holding the archive and the extracted SDK.
+  A complete entry is reused without network access (its archive sha256 and libpqxx.a digest are
+  re-checked on every use). Default cache: $LIBPQXX_SDK_CACHE, else ~/.cache/libpqxx-sdk.
+- the download must match the pinned sha256, and the archive's manifest.json must name the pinned
+  version and profile and match every extracted file; otherwise nothing is cached.
+- the host must be compatible with the SDK's target (OS, release >= target, architecture, glibc,
+  libpq.so.5 present) unless --no-host-check.
+- credentials (only if the repository is not anonymous-readable): LIBPQXX_SDK_USER and
+  LIBPQXX_SDK_PASSWORD, else ~/.netrc (or $NETRC) for the host. Use a read-only account.
+
+Exit codes: 0 ok · 1 usage/environment error · 3 checksum or manifest mismatch · 4 artifact
+unavailable (not published, unreachable, or not cached with --offline).
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import fcntl
+import hashlib
+import json
+import netrc
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+ARCHIVE = "libpqxx-sdk.tar.zst"
+PC_NAME = "libpqxx-vh"
+SDK_VERSION = re.compile(r"\d+\.\d+\.\d+-\d+")
+PROFILE = re.compile(r"[a-z0-9]+-[0-9.]+-[a-z0-9_]+")
+SHA256 = re.compile(r"[0-9a-f]{64}")
+ARCHES = {"x86_64": "amd64", "aarch64": "arm64"}
+
+
+class Failure(Exception):
+    def __init__(self, message: str, code: int = 1):
+        super().__init__(message)
+        self.code = code
+
+
+def note(message: str) -> None:
+    print(f"libpqxx-sdk-fetch: {message}", file=sys.stderr)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+# --- pin ----------------------------------------------------------------------------------------
+
+
+def load_pin(path: Path, base_override: str | None) -> dict:
+    try:
+        with path.open("rb") as handle:
+            pin = tomllib.load(handle)
+    except FileNotFoundError:
+        raise Failure(f"pin file {path} does not exist") from None
+    except tomllib.TOMLDecodeError as exc:
+        raise Failure(f"pin file {path}: {exc}") from None
+    base = base_override or os.environ.get("LIBPQXX_SDK_BASE_URL") or pin.get("base_url", "")
+    pin["base_url"] = base.rstrip("/")
+    checks = [("sdk_version", SDK_VERSION), ("profile", PROFILE), ("sha256", SHA256)]
+    for key, pattern in checks:
+        if not isinstance(pin.get(key), str) or not pattern.fullmatch(pin[key]):
+            raise Failure(f"pin file {path}: `{key}` is missing or malformed")
+    if not re.match(r"^(https://|http://127\.0\.0\.1[:/]|http://localhost[:/]|file:/)", pin["base_url"]):
+        raise Failure(f"pin file {path}: base_url must be https:// (got {pin['base_url']!r})")
+    return pin
+
+
+def artifact_url(pin: dict, name: str = ARCHIVE) -> str:
+    return f"{pin['base_url']}/libpqxx/{pin['sdk_version']}/{pin['profile']}/{name}"
+
+
+# --- download -----------------------------------------------------------------------------------
+
+
+def _request(url: str) -> urllib.request.Request:
+    request = urllib.request.Request(url, headers={"User-Agent": "libpqxx-sdk-fetch"})
+    user, password = os.environ.get("LIBPQXX_SDK_USER"), os.environ.get("LIBPQXX_SDK_PASSWORD")
+    host = urllib.parse.urlparse(url).hostname
+    if not (user and password) and host:
+        try:
+            entry = netrc.netrc(os.environ.get("NETRC")).authenticators(host)
+        except (FileNotFoundError, netrc.NetrcParseError, OSError):
+            entry = None
+        if entry:
+            user, password = entry[0], entry[2]
+    if user and password:
+        token = base64.b64encode(f"{user}:{password}".encode()).decode()
+        request.add_header("Authorization", f"Basic {token}")
+    return request
+
+
+def download(url: str, target: Path) -> None:
+    try:
+        with urllib.request.urlopen(_request(url), timeout=300) as response, target.open("wb") as out:
+            shutil.copyfileobj(response, out)
+    except urllib.error.HTTPError as exc:
+        target.unlink(missing_ok=True)
+        if exc.code == 404:
+            raise Failure(f"not published: {url} (HTTP 404). Check sdk_version/profile in the pin.", 4) from None
+        if exc.code in (401, 403):
+            raise Failure(f"access denied to {url} (HTTP {exc.code}); set read-only credentials "
+                          "(LIBPQXX_SDK_USER/LIBPQXX_SDK_PASSWORD or ~/.netrc)", 4) from None
+        raise Failure(f"download {url}: HTTP {exc.code}", 4) from None
+    except (urllib.error.URLError, OSError) as exc:
+        target.unlink(missing_ok=True)
+        raise Failure(f"download {url}: {getattr(exc, 'reason', exc)}", 4) from None
+
+
+# --- validation ---------------------------------------------------------------------------------
+
+
+def extract(archive: Path, dest: Path) -> Path:
+    """Extract into dest (which must be empty) and return the SDK root (the single top directory)."""
+    raw = subprocess.run(["zstd", "-dc", str(archive)], check=True, stdout=subprocess.PIPE).stdout
+    import io
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as tar:
+        tops = {m.name.split("/", 1)[0] for m in tar.getmembers()}
+        if len(tops) != 1:
+            raise Failure(f"{archive.name}: expected one top-level directory, found {sorted(tops)}", 3)
+        tar.extractall(dest, filter="data")
+    return dest / tops.pop()
+
+
+def validate_sdk(root: Path, pin: dict, *, full: bool) -> dict:
+    try:
+        manifest = json.loads((root / "manifest.json").read_text())
+    except (OSError, ValueError) as exc:
+        raise Failure(f"{root}: unreadable manifest.json ({exc})", 3) from None
+    if manifest.get("name") != "libpqxx-sdk" or manifest.get("schema") != 1:
+        raise Failure(f"{root}: not a libpqxx-sdk schema 1 manifest", 3)
+    for key in ("sdk_version", "profile"):
+        if manifest.get(key) != pin[key]:
+            raise Failure(f"manifest {key} is {manifest.get(key)!r}, the pin requires {pin[key]!r}", 3)
+    files = manifest.get("files", {})
+    on_disk = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()} - {"manifest.json"}
+    if full and on_disk != set(files):
+        raise Failure(f"{root}: files differ from the manifest: {sorted(on_disk ^ set(files))[:5]}", 3)
+    check = files if full else {k: v for k, v in files.items() if k in ("lib/libpqxx.a", f"lib/pkgconfig/{PC_NAME}.pc")}
+    for rel, digest in check.items():
+        if not (root / rel).is_file() or sha256_file(root / rel) != digest:
+            raise Failure(f"{root / rel}: content does not match manifest.json", 3)
+    return manifest
+
+
+def host_facts() -> dict:
+    rel = {}
+    try:
+        for line in Path("/etc/os-release").read_text().splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                rel[k] = v.strip().strip('"')
+    except OSError:
+        pass
+    return {"os": rel.get("ID"), "version": rel.get("VERSION_ID", ""),
+            "arch": ARCHES.get(platform.machine(), platform.machine()), "glibc": platform.libc_ver()[1]}
+
+
+def _vtuple(text: str) -> tuple[int, ...]:
+    return tuple(int(p) for p in re.findall(r"\d+", text))
+
+
+def check_host(manifest: dict) -> None:
+    target, req = manifest["target"], manifest["requirements"]
+    host = host_facts()
+    problems = []
+    if host["os"] != target["os"]:
+        problems.append(f"host OS is {host['os']}, the SDK targets {target['os']}")
+    elif _vtuple(host["version"]) < _vtuple(target["os_version"]):
+        problems.append(f"host is {host['os']} {host['version']}, the SDK needs {target['os_version']} or newer")
+    if host["arch"] != target["debian_arch"]:
+        problems.append(f"host architecture is {host['arch']}, the SDK is {target['debian_arch']}")
+    need_glibc = (req.get("glibc") or "GLIBC_0").split("_", 1)[1]
+    if host["glibc"] and _vtuple(host["glibc"]) < _vtuple(need_glibc):
+        problems.append(f"host glibc {host['glibc']} is older than the required {need_glibc}")
+    soname = req["libpq"]["soname"]
+    if not any(Path(d, soname).exists() for d in (f"/usr/lib/{target['gnu_triplet']}", "/usr/lib", "/lib")):
+        problems.append(f"{soname} is not installed (apt install {req['libpq']['package']})")
+    if problems:
+        raise Failure("SDK " + manifest["sdk_version"] + "/" + manifest["profile"] + " is not compatible with this host:\n  - "
+                      + "\n  - ".join(problems) + "\n(--no-host-check to override, e.g. for cross builds)")
+
+
+# --- cache --------------------------------------------------------------------------------------
+
+
+def acquire(pin: dict, cache: Path, *, offline: bool) -> tuple[Path, dict]:
+    entry = cache / f"{pin['sdk_version']}-{pin['profile']}-{pin['sha256'][:16]}"
+    entry.mkdir(parents=True, exist_ok=True)
+    with (entry / ".lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # concurrent builds sharing a cache wait for each other
+        archive, sdk_dir, stamp = entry / ARCHIVE, entry / "sdk", entry / ".complete"
+        archive_ok = archive.is_file() and sha256_file(archive) == pin["sha256"]
+        if stamp.is_file():
+            recorded = json.loads(stamp.read_text())
+            if archive_ok and recorded.get("sha256") == pin["sha256"]:
+                root = sdk_dir / recorded["top"]
+                try:
+                    manifest = validate_sdk(root, pin, full=False)
+                    note(f"cached: {root}")
+                    return root, manifest
+                except Failure as exc:
+                    note(f"cached SDK is damaged ({exc}); re-extracting the verified cached archive")
+            else:
+                note(f"cache entry {entry.name} is damaged; fetching again")
+            stamp.unlink()
+
+        url = artifact_url(pin)
+        if not archive_ok:
+            if offline:
+                raise Failure(f"SDK {pin['sdk_version']}/{pin['profile']} is not cached in {cache} and --offline was given", 4)
+            note(f"downloading {url}")
+            part = entry / (ARCHIVE + ".part")
+            download(url, part)
+            actual = sha256_file(part)
+            if actual != pin["sha256"]:
+                part.unlink()
+                raise Failure(f"checksum mismatch for {url}:\n  expected {pin['sha256']}\n  received {actual}\n"
+                              "Nothing was cached. Do not update the pin unless the new bytes are a reviewed release.", 3)
+            part.replace(archive)
+
+        if sdk_dir.exists():
+            shutil.rmtree(sdk_dir)
+        tmp = Path(tempfile.mkdtemp(prefix=".extract-", dir=entry))
+        try:
+            root = extract(archive, tmp)
+            manifest = validate_sdk(root, pin, full=True)
+            tmp.rename(sdk_dir)
+        except BaseException:
+            shutil.rmtree(tmp, ignore_errors=True)
+            archive.unlink(missing_ok=True)
+            raise
+        root = sdk_dir / root.name
+        stamp.write_text(json.dumps({"sha256": pin["sha256"], "top": root.name, "url": url}) + "\n")
+        note(f"installed {root}")
+        return root, manifest
+
+
+def make_pin(sdk_version: str, profile: str, base_url: str) -> str:
+    pin = {"sdk_version": sdk_version, "profile": profile, "base_url": base_url.rstrip("/"), "sha256": "0" * 64}
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp) / "sha256"
+        download(artifact_url(pin, ARCHIVE + ".sha256"), target)
+        digest = target.read_text().split()[0]
+    if not SHA256.fullmatch(digest):
+        raise Failure("published .sha256 is malformed", 3)
+    return (f'# Pinned libpqxx static SDK (https://github.com/vaulthalla/libpqxx).\n'
+            f'# Change sdk_version, profile and sha256 together, deliberately.\n'
+            f'sdk_version = "{sdk_version}"\nprofile = "{profile}"\nsha256 = "{digest}"\n'
+            f'base_url = "{pin["base_url"]}"\n')
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="libpqxx-sdk-fetch", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--pin", type=Path, help="pin file (TOML)")
+    parser.add_argument("--cache-dir", type=Path)
+    parser.add_argument("--base-url", help="override the pin's base_url (e.g. a mirror)")
+    parser.add_argument("--offline", action="store_true", help="use only the cache")
+    parser.add_argument("--no-host-check", action="store_true")
+    parser.add_argument("--format", choices=["path", "env", "meson", "json"], default="path")
+    parser.add_argument("--make-pin", nargs=2, metavar=("SDK_VERSION", "PROFILE"))
+    args = parser.parse_args(argv)
+    try:
+        if args.make_pin:
+            if not args.base_url:
+                raise Failure("--make-pin needs --base-url")
+            sys.stdout.write(make_pin(*args.make_pin, args.base_url))
+            return 0
+        if not args.pin:
+            raise Failure("--pin is required")
+        if not shutil.which("zstd"):
+            raise Failure("the `zstd` program is required (apt install zstd)")
+        pin = load_pin(args.pin, args.base_url)
+        cache = args.cache_dir or Path(os.environ.get("LIBPQXX_SDK_CACHE") or Path.home() / ".cache" / "libpqxx-sdk")
+        root, manifest = acquire(pin, cache.resolve(), offline=args.offline)
+        if not args.no_host_check:
+            check_host(manifest)
+        pc_dir = root / "lib" / "pkgconfig"
+        if args.format == "env":
+            print(f"PKG_CONFIG_PATH={pc_dir}")
+        elif args.format == "meson":
+            print(f"-Dpkg_config_path={pc_dir}")
+        elif args.format == "json":
+            print(json.dumps({"pkg_config_path": str(pc_dir), "sdk": str(root), "sdk_version": manifest["sdk_version"],
+                              "profile": manifest["profile"], "sha256": pin["sha256"]}))
+        else:
+            print(pc_dir)
+        return 0
+    except Failure as exc:
+        note(f"error: {exc}")
+        return exc.code
+    except subprocess.CalledProcessError as exc:
+        note(f"error: {exc}")
+        return 3
+
+
+if __name__ == "__main__":
+    sys.exit(main())

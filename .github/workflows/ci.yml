@@ -1,0 +1,65 @@
+name: CI
+
+# Every push to main and every pull request from this repository: tooling unit tests and
+# repository consistency, then one guarded SDK build (upstream tests included) with the consumer,
+# acquisition and publication-rule tests. Fork pull requests never run on the self-hosted runner.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI_CACHE_NAMES: ccache
+  PQXX_JOBS: "4"
+  CI_MEMORY: 6g
+  PROFILE: ubuntu-24.04-amd64
+
+jobs:
+  checks:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, vaulthalla, vps-ci]
+    defaults:
+      run:
+        shell: bash ./ci/run-ci bash -euo pipefail {0}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: python3 -m unittest discover -s tests/unit -t .
+      - run: python3 tools/pqxx-sdk check
+      - run: vlr check
+      - run: python3 tools/pqxx-sdk fetch-source
+
+  sdk:
+    needs: checks
+    runs-on: [self-hosted, Linux, X64, vaulthalla, vps-ci]
+    defaults:
+      run:
+        shell: bash ./ci/run-ci bash -euo pipefail {0}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the SDK (upstream tests included)
+        shell: bash ./tools/ci-guard -- ./ci/run-ci bash -euo pipefail {0}
+        run: tests/pg-sandbox python3 tools/pqxx-sdk build --profile "$PROFILE" --tests
+      - name: Inspect, consume, acquire, publication rules
+        run: |
+          archive="$(ls release/build/sdk/dist/libpqxx-sdk-*-"$PROFILE".tar.zst)"
+          python3 tools/pqxx-sdk inspect "$archive" --auto-sidecar --pinned-source
+          tests/pg-sandbox tests/sdk-test "$archive" --record "${archive%.tar.zst}.tests.json"
+          tests/fetch-test "$archive"
+          tests/publish-test release/build/sdk/dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libpqxx-sdk-ci
+          path: release/build/sdk/dist/
+          retention-days: 7

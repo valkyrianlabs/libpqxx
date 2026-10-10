@@ -1,0 +1,299 @@
+name: Release
+
+# Releases are cut with vl-release: `vlr cut patch|X.Y.Z --push` bumps, commits and tags; the v* tag
+# push starts this workflow. Release semantics live in `vlr` commands and tools/pqxx-sdk
+# (docs/RELEASING.md); this file provides triggers, runners, credentials and job ordering.
+#
+# Transaction: check -> prepare + build SDK (+ upstream tests) + package + consumer tests +
+# validate (artifact) -> publish libpqxx-vh-dev to APT (apt.vaulthalla.sh) [+ the SDK archive to
+# Nexus Raw when NEXUS_RAW_REPO is configured] -> GitHub release -> finalize. libpqxx is compiled
+# exactly once; every later job reuses the uploaded artifact. A failed run leaves the repository
+# untouched and can be re-run; publication never replaces published bytes.
+#
+# Configuration follows Vaulthalla/PDFium: environment `Production` with secrets NEXUS_USER and
+# NEXUS_PASS and variables NEXUS_REPO_URL (APT upload URL) and RELEASE_PUBLISH_MODE=nexus.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or SHA to release-check (default the selected ref).
+        required: false
+        type: string
+      publish:
+        description: Publish (requires a v* tag ref) or only build and validate.
+        required: true
+        default: dry-run
+        type: choice
+        options:
+          - dry-run
+          - publish
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_REF: ${{ github.event.inputs.ref || github.ref }}
+  CI_CACHE_NAMES: ccache
+  PQXX_JOBS: "4"
+  CI_MEMORY: 6g
+  PROFILE: ubuntu-24.04-amd64
+
+jobs:
+  release-check:
+    name: Release check
+    runs-on: [self-hosted, Linux, X64, vaulthalla, vps-ci]
+    defaults:
+      run:
+        shell: bash ./ci/run-ci bash -euo pipefail {0}
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.state.outputs.version }}
+      tag: ${{ steps.state.outputs.tag }}
+      publish_required: ${{ steps.state.outputs.publish_required }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          fetch-depth: 0
+      - name: Check the release contract
+        id: state
+        env:
+          DISPATCH_PUBLISH: ${{ github.event.inputs.publish || 'dry-run' }}
+        run: |
+          version="$(tr -d '[:space:]' < VERSION)"
+          tag=""
+          case "$RELEASE_REF" in
+            refs/tags/*) tag="${RELEASE_REF#refs/tags/}" ;;
+            v[0-9]*) tag="$RELEASE_REF" ;;
+          esac
+          publish_required=false
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] || [ "$DISPATCH_PUBLISH" = "publish" ]; then
+            publish_required=true
+            if [ -z "$tag" ]; then
+              echo "::error::Publication requires a v* tag ref, got '${RELEASE_REF}'."
+              exit 1
+            fi
+          fi
+          if [ -n "$tag" ]; then vlr check --release --tag "$tag"; else vlr check --release; fi
+          vlr version check
+          python3 tools/pqxx-sdk check
+          python3 -m unittest discover -s tests/unit -t .
+          vlr status
+          {
+            echo "version=${version}"
+            echo "tag=${tag}"
+            echo "publish_required=${publish_required}"
+          } >> "$GITHUB_OUTPUT"
+
+  release-artifacts:
+    name: Build, test and validate release artifacts
+    needs: release-check
+    runs-on: [self-hosted, Linux, X64, vaulthalla, vps-ci]
+    defaults:
+      run:
+        shell: bash ./ci/run-ci bash -euo pipefail {0}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Prepare release history (work tree only)
+        run: vlr prepare --record release/dist/meta/prepare.json
+
+      # The only compile of the release: pinned source (sha256 + embedded commit verified),
+      # upstream CMake + Ninja, upstream's test suite against a throwaway PostgreSQL, SDK archive.
+      - name: Build the SDK
+        shell: bash ./tools/ci-guard -- ./ci/run-ci bash -euo pipefail {0}
+        run: |
+          tests/pg-sandbox python3 tools/pqxx-sdk build --profile "$PROFILE" --tests
+          echo "peak container memory: $(( $(cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo 0) / 1048576 )) MiB"
+
+      # Repackages the SDK archive (no compile) and collects the SDK assets into release/dist.
+      - name: Build the optional Debian package
+        run: vlr build-deb
+
+      - name: Consumer, acquisition and publication-rule tests
+        run: |
+          base="$(python3 tools/pqxx-sdk version | python3 -c "import json,sys; print(json.load(sys.stdin)['profiles']['$PROFILE']['archive'])")"
+          python3 tools/pqxx-sdk inspect "release/dist/$base" --auto-sidecar --pinned-source
+          tests/pg-sandbox tests/sdk-test "release/dist/$base" --record "release/dist/${base%.tar.zst}.tests.json"
+          tests/fetch-test "release/dist/$base"
+          tests/publish-test release/dist
+
+      # Stock Ubuntu containers: clean 24.04, next to Ubuntu's libpqxx-dev, 26.04 LTS; and the .deb.
+      - name: Container consumer matrix and Debian package test
+        shell: bash -euo pipefail {0}
+        run: |
+          base="$(ls release/dist/libpqxx-sdk-*-"$PROFILE".tar.zst)"
+          tests/containers/run "$base" noble-clean noble-system-libpqxx resolute resolute-gcc14
+          tests/deb-test release/dist
+
+      - name: Checksums, artifact contracts and the publication gate
+        env:
+          NEXUS_RAW_REPO: ${{ vars.NEXUS_RAW_REPO }}
+        run: |
+          vlr checksums
+          vlr validate-artifacts
+          RELEASE_PUBLISH_MODE=disabled python3 tools/pqxx-sdk publish
+          # Read-only plan against the real repository: refuses now if a different artifact
+          # already occupies this version's path.
+          if [ -n "${NEXUS_RAW_REPO:-}" ]; then python3 tools/pqxx-sdk publish --dry-run; fi
+          vlr artifacts
+
+      - name: Preview GitHub release
+        run: |
+          vlr release-title
+          vlr release-body
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: libpqxx-sdk-release-${{ needs.release-check.outputs.version }}
+          path: release/dist/
+          include-hidden-files: true
+          if-no-files-found: error
+
+  publish-sdk:
+    name: Publish the SDK to Nexus Raw (optional)
+    runs-on: [self-hosted, Linux, X64, vaulthalla, vps-ci]
+    defaults:
+      run:
+        shell: bash ./ci/run-ci bash -euo pipefail {0}
+    needs: [release-check, release-artifacts]
+    if: needs.release-check.outputs.publish_required == 'true' && vars.NEXUS_RAW_REPO != ''
+    environment: Production
+    timeout-minutes: 30
+    concurrency:
+      group: nexus-cpp-sdk-publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: libpqxx-sdk-release-${{ needs.release-check.outputs.version }}
+          path: release/dist/
+      - name: Verify artifacts
+        run: vlr checksums --verify
+      # Gate (inspection + passing consumer test record for these bytes), repository preflight,
+      # absent -> upload / identical -> skip / different -> refuse, then download-and-hash.
+      - name: Publish to Nexus Raw
+        env:
+          RELEASE_PUBLISH_MODE: ${{ vars.RELEASE_PUBLISH_MODE || 'disabled' }}
+          NEXUS_RAW_REPO: ${{ vars.NEXUS_RAW_REPO }}
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD || secrets.NEXUS_PASS }}
+        run: python3 tools/pqxx-sdk publish --require-enabled
+
+  publish-debian:
+    name: Publish libpqxx-vh-dev to APT
+    runs-on: [self-hosted, Linux, X64, vaulthalla, vps-ci]
+    defaults:
+      run:
+        shell: bash ./ci/run-ci bash -euo pipefail {0}
+    needs: [release-check, release-artifacts]
+    if: needs.release-check.outputs.publish_required == 'true'
+    environment: Production
+    timeout-minutes: 45
+    concurrency:
+      group: vaulthalla-apt-publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          fetch-depth: 0
+      - name: Prepare release history (deterministic re-run)
+        run: vlr prepare
+      - uses: actions/download-artifact@v4
+        with:
+          name: libpqxx-sdk-release-${{ needs.release-check.outputs.version }}
+          path: release/dist/
+      - name: Verify artifacts
+        run: |
+          vlr checksums --verify
+          vlr validate-artifacts
+      - name: Publish to the APT repository
+        env:
+          RELEASE_PUBLISH_MODE: ${{ vars.RELEASE_PUBLISH_MODE || 'disabled' }}
+          NEXUS_APT_REPO: ${{ vars.NEXUS_APT_REPO || vars.NEXUS_REPO_URL }}
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD || secrets.NEXUS_PASS }}
+        run: vlr publish-deb --require-enabled
+
+  github-release:
+    name: GitHub release
+    runs-on: [self-hosted, Linux, X64, vaulthalla, vps-ci]
+    defaults:
+      run:
+        shell: bash ./ci/run-ci bash -euo pipefail {0}
+    needs: [release-check, publish-debian, publish-sdk]
+    if: >-
+      !cancelled() &&
+      needs.release-check.outputs.publish_required == 'true' &&
+      needs.publish-debian.result == 'success' &&
+      (needs.publish-sdk.result == 'success' || needs.publish-sdk.result == 'skipped')
+    permissions:
+      contents: write
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          fetch-depth: 0
+      - name: Prepare release history (deterministic re-run)
+        run: vlr prepare
+      - uses: actions/download-artifact@v4
+        with:
+          name: libpqxx-sdk-release-${{ needs.release-check.outputs.version }}
+          path: release/dist/
+      - name: Verify artifacts
+        run: vlr checksums --verify
+      - name: Create or update the GitHub release (SDK archives, manifests, test records, .deb)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: vlr github-release
+
+  finalize:
+    name: Record the release on main
+    runs-on: [self-hosted, Linux, X64, vaulthalla, vps-ci]
+    defaults:
+      run:
+        shell: bash ./ci/run-ci bash -euo pipefail {0}
+    needs: [release-check, github-release]
+    if: >-
+      !cancelled() &&
+      needs.release-check.outputs.publish_required == 'true' &&
+      needs.github-release.result == 'success'
+    permissions:
+      contents: write
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_FINALIZE_TOKEN || github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: libpqxx-sdk-release-${{ needs.release-check.outputs.version }}
+          path: release/dist/
+      - name: Prepare release history (deterministic re-run)
+        run: vlr prepare
+      - name: Finalize
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          vlr finalize --record release/dist/meta/prepare.json

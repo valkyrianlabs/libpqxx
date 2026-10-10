@@ -1,0 +1,23 @@
+#!/usr/bin/make -f
+# libpqxx-vh-dev repackages the SDK archive `tools/pqxx-sdk build` produced (the same bytes that
+# are published to Nexus Raw) at a namespaced prefix. Nothing is compiled here.
+#
+# `vlr build-deb` builds in release/build/deb/src, so the SDK assets are in ../../sdk/dist.
+DEB_HOST_ARCH ?= $(shell dpkg-architecture -qDEB_HOST_ARCH)
+DEB_HOST_MULTIARCH ?= $(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
+SDK_PROFILE ?= ubuntu-24.04-$(DEB_HOST_ARCH)
+SDK_DIST ?= $(CURDIR)/../../sdk/dist
+
+%:
+	dh $@
+
+override_dh_auto_configure override_dh_auto_build override_dh_auto_test:
+
+override_dh_auto_install:
+	python3 tools/pqxx-sdk deb-install --profile $(SDK_PROFILE) --dist $(SDK_DIST) \
+	  --destdir debian/libpqxx-vh-dev --multiarch $(DEB_HOST_MULTIARCH) \
+	  --substvars debian/libpqxx-vh-dev.substvars
+
+# The archive and headers must stay byte-identical to the published SDK (manifest.json digests):
+# no stripping or other rewriting of the shipped files.
+override_dh_strip override_dh_dwz override_dh_strip_nondeterminism override_dh_shlibdeps:

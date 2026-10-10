@@ -1,0 +1,25 @@
+Source: libpqxx-vh
+Section: libdevel
+Priority: optional
+Maintainer: Cooper Larson <cooper@valkyrianlabs.com>
+Build-Depends: debhelper-compat (= 13), python3, zstd
+Standards-Version: 4.6.2
+Homepage: https://github.com/vaulthalla/libpqxx
+Rules-Requires-Root: no
+
+Package: libpqxx-vh-dev
+Architecture: amd64
+Multi-Arch: same
+Depends: libpq5 (>= ${sdk:LibpqMin}), ${misc:Depends}
+Description: libpqxx ${sdk:Upstream} static C++ PostgreSQL SDK (Vaulthalla build)
+ Development-only package of the Vaulthalla libpqxx SDK ${sdk:Version} (profile
+ ${sdk:Profile}): the precompiled static libpqxx.a, the matching official headers and
+ generated configuration header, and pkg-config metadata named libpqxx-vh.
+ .
+ Everything installs below /usr/lib/<multiarch>/libpqxx-vh plus
+ /usr/lib/<multiarch>/pkgconfig/libpqxx-vh.pc, so it coexists with Ubuntu's
+ libpqxx-dev. There is no runtime package: programs link the archive statically and
+ load only the system libpq (libpq.so.5) at run time.
+ .
+ The files are byte-identical to the SDK archive published on Nexus; manifest.json
+ records the upstream source and build provenance.
