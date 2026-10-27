@@ -30,7 +30,7 @@ Copy `tools/libpqxx-sdk-fetch` unchanged (one file; Python ≥ 3.11 standard lib
 program) into the consumer, e.g. `tools/libpqxx-sdk-fetch`, and track a pin:
 
 ```toml
-# deps/libpqxx-sdk.toml — pinned libpqxx static SDK (https://github.com/vaulthalla/libpqxx).
+# deps/libpqxx-sdk.toml — pinned libpqxx static SDK (https://github.com/valkyrianlabs/libpqxx).
 # Change sdk_version, profile and sha256 together, deliberately.
 sdk_version = "8.0.2-1"
 profile = "ubuntu-24.04-amd64"

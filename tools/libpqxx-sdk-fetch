@@ -279,7 +279,7 @@ def make_pin(sdk_version: str, profile: str, base_url: str) -> str:
         digest = target.read_text().split()[0]
     if not SHA256.fullmatch(digest):
         raise Failure("published .sha256 is malformed", 3)
-    return (f'# Pinned libpqxx static SDK (https://github.com/vaulthalla/libpqxx).\n'
+    return (f'# Pinned libpqxx static SDK (https://github.com/valkyrianlabs/libpqxx).\n'
             f'# Change sdk_version, profile and sha256 together, deliberately.\n'
             f'sdk_version = "{sdk_version}"\nprofile = "{profile}"\nsha256 = "{digest}"\n'
             f'base_url = "{pin["base_url"]}"\n')
