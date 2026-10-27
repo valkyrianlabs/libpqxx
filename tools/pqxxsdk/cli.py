@@ -143,6 +143,13 @@ def cmd_verify_published(args) -> int:
     return 0
 
 
+def cmd_gate(args) -> int:
+    from .gate import run_gate
+
+    status = run_gate(args.result, github_output=args.github_output)
+    return 0 if args.github_output is not None else status
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="pqxx-sdk", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -208,6 +215,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--output-dir", default=str(publish_mod.DEFAULT_OUTPUT))
     p.add_argument("--timeout", type=int, default=300)
     p.set_defaults(func=cmd_verify_published)
+
+    p = sub.add_parser("gate", help="decide whether an upstream candidate may be released without a maintainer")
+    p.add_argument("result", nargs="?", default="release/build/upstream-candidate/result.json",
+                   help="the candidate's result.json (default: release/build/upstream-candidate/result.json)")
+    p.add_argument("--github-output", nargs="?", const="", default=None,
+                   help="append release/version/blockers to this file ($GITHUB_OUTPUT without a value) and exit 0")
+    p.set_defaults(func=cmd_gate)
 
     args = parser.parse_args(argv)
     try:

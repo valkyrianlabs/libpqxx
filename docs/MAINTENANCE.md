@@ -17,8 +17,19 @@ Discovery ignores drafts, prereleases and non-`X.Y.Z` tags, and orders by versio
 publishes maintenance releases of older series after newer ones (7.10.7 appeared after 8.0.2), so
 "most recently published" would be wrong. `upstream.yml` runs discovery weekly and opens a pull
 request with the candidate report, which includes upstream's NEWS entry and the diff of upstream's
-build files (`CMakeLists.txt`, `cmake/`, `requirements.json`, …) since the pinned release. Nothing
-is published without a merged PR and a `vlr cut`.
+build files (`CMakeLists.txt`, `cmake/`, `requirements.json`, …) since the pinned release.
+
+**Auto-release.** `tools/upstream-candidate` also writes `release/build/upstream-candidate/result.json`,
+and `tools/pqxx-sdk gate` (`tools/pqxxsdk/gate.py`) decides from it. A candidate is released
+without a maintainer only when it passed (SDK build with upstream's tests, inspect, consumer and
+acquisition tests), it is a **patch release of the pinned major.minor** (8.0.2 → 8.0.3; a minor or
+major release can change the API), upstream's **build-system files and `requirements.json` are
+unchanged**, and `main` has not moved since the candidate was built. Then `upstream.yml` merges
+the pull request, `vlr cut <VERSION> --push` tags the merge commit, and `release.yml` is
+dispatched on the tag with `publish: publish`. Everything else stays a pull request labelled
+`needs-review`, with the reasons. Consumers pin the SDK version (`deps/libpqxx-sdk.toml`), so a
+new release changes nothing for them until they bump the pin. The repository variable
+`UPSTREAM_AUTO_RELEASE=false` turns auto-release off.
 
 Rebuilding an older release never fetches anything newer: check out the tag (or pin it with
 `pqxx-sdk pin 8.0.1`), and the build uses exactly that lock.
