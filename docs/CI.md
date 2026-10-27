@@ -48,6 +48,6 @@ that same archive instead of compiling again.
 |---|---|---|
 | `ci.yml` | push to main, PRs from this repository | unit tests, `pqxx-sdk check`, `vlr check`, source verification; guarded build with upstream tests; inspect, consumer, acquisition and publication-rule tests |
 | `release.yml` | `v*` tag, manual (`publish: dry-run` default) | docs/RELEASING.md |
-| `upstream.yml` | weekly, manual | discover; candidate build/test; pull request with the report |
+| `upstream.yml` | weekly, manual | discover; candidate build/test; pull request with the report; on a passing `pqxx-sdk gate`, merge, `vlr cut` and dispatch `release.yml` on the tag |
 
 Fork pull requests never run on the self-hosted runner.

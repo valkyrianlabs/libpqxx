@@ -9,8 +9,9 @@
 #   .release/*_NEXT.md   a changelog bullet; release notes if none are staged
 # then builds the SDK with upstream's tests, runs the consumer and acquisition tests, and writes
 # release/build/upstream-candidate/report.md (also used as the pull request body), including the
-# diff of upstream's build files and stated requirements since the previously pinned release.
-# Nothing is committed or published.
+# diff of upstream's build files and stated requirements since the previously pinned release, and
+# the machine-readable result.json (`tools/pqxx-sdk gate` decides from it whether upstream.yml may
+# release without a maintainer). Nothing is committed or published.
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo"
@@ -36,7 +37,9 @@ commit=$(python3 -c 'import json; print(json.load(open("upstream.lock.json"))["u
 url=$(python3 -c 'import json; print(json.load(open("upstream.lock.json"))["upstream"]["release_url"])')
 
 printf -- '- Update libpqxx to %s (tag %s, commit %s).\n' "$new_version" "$new_version" "${commit:0:12}" >> .release/CHANGELOG_NEXT.md
+notes_generated=false
 if ! grep -q '^# ' .release/RELEASE_NOTES_NEXT.md; then
+  notes_generated=true
   cat > .release/RELEASE_NOTES_NEXT.md <<EOF
 # libpqxx $new_version static SDK
 
@@ -63,6 +66,17 @@ build_diff=$(diff -ru "$old_src" "$new_src" --unidirectional-new-file \
 requirements=$(diff -u "$old_src/requirements.json" "$new_src/requirements.json" 2>/dev/null || true)
 news=$(awk -v v="$new_version" 'NR==1,0 { if ($0 ~ "^"v) p=1; else if (p && $0 ~ /^[0-9]+\.[0-9]+\.[0-9]+/) exit; if (p) print }' "$new_src/NEWS" | head -60)
 rm -rf "$old_src"
+if [ "$notes_generated" = true ] && [ -n "$news" ]; then
+  { printf '\nUpstream NEWS for %s:\n\n```\n%s\n```\n' "$new_version" "$news"; } >> .release/RELEASE_NOTES_NEXT.md
+fi
+python3 - "$out/result.json" "$status" "$old_version" "$new_version" "$release" "$commit" \
+  "$([ -n "$requirements" ] && echo true || echo false)" "$([ -n "$build_diff" ] && echo true || echo false)" <<'EOF'
+import json, sys
+path, status, old, new, release, commit, requirements, build = sys.argv[1:]
+json.dump({"status": status, "old_version": old, "new_version": new, "release": release, "commit": commit,
+           "requirements_changed": requirements == "true", "build_files_changed": build == "true"},
+          open(path, "w"), indent=2)
+EOF
 
 {
   echo "## libpqxx $old_version → $new_version"

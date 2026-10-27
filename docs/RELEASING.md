@@ -54,7 +54,13 @@ tools/release-rehearsal          # the whole pipeline locally (isolated copy), n
 vlr cut 8.0.2-1 --push           # first release; later: vlr cut revision --push, or vlr cut X.Y.Z-1 --push
 ```
 
-The tag push starts `release.yml`:
+The tag push starts `release.yml`. Upstream patch releases that pass `pqxx-sdk gate` are released by
+`upstream.yml` itself (docs/MAINTENANCE.md, *Auto-release*): it merges the pull request, runs
+`vlr cut X.Y.Z-1 --push --skip-tests` on the merge commit and dispatches this workflow on the tag with
+`publish: publish` (a GITHUB_TOKEN tag push starts nothing, so there is one release run). Finalize
+uses `RELEASE_FINALIZE_TOKEN` when set, else the job token (enough while `main` is unprotected).
+
+The release run:
 
 1. **release-check:** `vlr check --release`, `vlr version check`, `pqxx-sdk check`, unit tests.
 2. **release-artifacts:** `vlr prepare`; `pqxx-sdk build --tests` (the only compile, upstream test
