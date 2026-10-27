@@ -75,7 +75,7 @@ A manual run with `publish: dry-run` builds and validates everything without pub
 
 | What | Where | Value |
 |---|---|---|
-| Self-hosted runner access | org runner group `Default` (selected repositories) | add `vaulthalla/libpqxx` |
+| Self-hosted runner access | org runner group `Default` (selected repositories) | add `valkyrianlabs/libpqxx` |
 | `NEXUS_USER`, `NEXUS_PASS` | `Production` environment **secrets** | the Nexus APT upload account (same as Vaulthalla's/PDFium's) |
 | `NEXUS_REPO_URL` | `Production` environment variable | `https://apt.valkyrianlabs.com` |
 | `RELEASE_PUBLISH_MODE` | `Production` environment variable | `nexus` |

@@ -1,6 +1,6 @@
 # CI and build resources
 
-Workflows run on the shared self-hosted runner (`[self-hosted, Linux, X64, vaulthalla, vps-ci]`),
+Workflows run on the shared self-hosted runner (`[self-hosted, Linux, X64, vps-ci]`),
 like Vaulthalla and PDFium. Nothing runs on the host directly:
 
 - Every step runs in a disposable rootless Podman container: `ci/run-ci` (byte-identical to

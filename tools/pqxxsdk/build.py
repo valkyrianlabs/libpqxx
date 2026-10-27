@@ -212,7 +212,7 @@ BSD 3-Clause license: see licenses/libpqxx/COPYING. AUTHORS lists the contributo
 The archive links dynamically against the system PostgreSQL client library (libpq, PostgreSQL
 License), the C library and the C++ standard library; none of them are included here.
 
-Packaged by Vaulthalla (https://github.com/vaulthalla/libpqxx). manifest.json records the exact
+Packaged by Vaulthalla (https://github.com/valkyrianlabs/libpqxx). manifest.json records the exact
 upstream source, build configuration and compatibility requirements.
 """
 

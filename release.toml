@@ -11,7 +11,7 @@ requires = ">=0.5,<1"  # 0.5: [version] policy
 [project]
 name = "Vaulthalla libpqxx SDK"
 package = "libpqxx-vh"
-repository = "vaulthalla/libpqxx"
+repository = "valkyrianlabs/libpqxx"
 
 [version]
 # UPSTREAM-REVISION: 8.0.2-1 is upstream libpqxx 8.0.2, SDK revision 1, and is also the tag

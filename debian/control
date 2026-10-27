@@ -4,7 +4,7 @@ Priority: optional
 Maintainer: Cooper Larson <cooper@valkyrianlabs.com>
 Build-Depends: debhelper-compat (= 13), python3, zstd
 Standards-Version: 4.6.2
-Homepage: https://github.com/vaulthalla/libpqxx
+Homepage: https://github.com/valkyrianlabs/libpqxx
 Rules-Requires-Root: no
 
 Package: libpqxx-vh-dev
