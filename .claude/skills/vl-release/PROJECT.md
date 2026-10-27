@@ -28,7 +28,7 @@ this file says how it applies here.
 
 - **Debian packages** (built by `vlr build-deb` from `debian/`, revision 1):
   - `libpqxx-vh-dev`: architecture `amd64`; must ship `usr/lib/x86_64-linux-gnu/libpqxx-vh/lib/libpqxx.a`, `usr/lib/x86_64-linux-gnu/libpqxx-vh/lib/pkgconfig/libpqxx-vh.pc`, `usr/lib/x86_64-linux-gnu/libpqxx-vh/include/pqxx/pqxx`, `usr/lib/x86_64-linux-gnu/libpqxx-vh/manifest.json`, `usr/lib/x86_64-linux-gnu/libpqxx-vh/licenses/libpqxx/COPYING`, `usr/lib/x86_64-linux-gnu/pkgconfig/libpqxx-vh.pc`, `usr/share/doc/libpqxx-vh-dev/copyright`; must never ship `usr/include/*`, `usr/lib/x86_64-linux-gnu/libpqxx.*`, `usr/lib/x86_64-linux-gnu/libpqxx-[0-9]*`, `usr/lib/x86_64-linux-gnu/pkgconfig/libpqxx.pc`, `usr/lib/x86_64-linux-gnu/cmake/*`, `*.so`, `*.so.*`
-- **APT**: https://apt.vaulthalla.sh (suite `stable`, components main), published by release CI with `vlr publish-deb`
+- **APT**: https://apt.valkyrianlabs.com (suite `stable`, components main), published by release CI with `vlr publish-deb`
 
 ## Before considering substantial work complete
 

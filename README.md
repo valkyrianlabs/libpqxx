@@ -13,7 +13,7 @@ no committed upstream source, no system-wide libpqxx anywhere.
 | Version | `8.0.2-1` = libpqxx 8.0.2, SDK revision 1 (vl-release `debian-upstream` policy): tag `v8.0.2-1`, package `libpqxx-vh-dev 8.0.2-1` |
 | Build | upstream CMake 3.28 + Ninja, g++ 14.2 (Ubuntu 24.04), C++20, `-O3 -DNDEBUG`, PIC, `-march=x86-64 -mtune=generic`, hardening, no LTO, no patches |
 | Consumers | `dependency('libpqxx-vh', method: 'pkg-config', static: true)`; libpqxx static, system `libpq.so.5` dynamic |
-| APT (primary) | `libpqxx-vh-dev` on apt.vaulthalla.sh (namespaced; coexists with Ubuntu's `libpqxx-dev`) |
+| APT (primary) | `libpqxx-vh-dev` on apt.valkyrianlabs.com, also served as apt.vaulthalla.sh (namespaced; coexists with Ubuntu's `libpqxx-dev`) |
 | Nexus Raw (optional) | `libpqxx/<upstream>-<rev>/<profile>/libpqxx-sdk.tar.zst` (+ `.sha256`, `manifest.json`) |
 
 ## Status

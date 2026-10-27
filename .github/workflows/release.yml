@@ -5,7 +5,7 @@ name: Release
 # (docs/RELEASING.md); this file provides triggers, runners, credentials and job ordering.
 #
 # Transaction: check -> prepare + build SDK (+ upstream tests) + package + consumer tests +
-# validate (artifact) -> publish libpqxx-vh-dev to APT (apt.vaulthalla.sh) [+ the SDK archive to
+# validate (artifact) -> publish libpqxx-vh-dev to APT (apt.valkyrianlabs.com) [+ the SDK archive to
 # Nexus Raw when NEXUS_RAW_REPO is configured] -> GitHub release -> finalize. libpqxx is compiled
 # exactly once; every later job reuses the uploaded artifact. A failed run leaves the repository
 # untouched and can be re-run; publication never replaces published bytes.
@@ -207,8 +207,9 @@ jobs:
     if: needs.release-check.outputs.publish_required == 'true'
     environment: Production
     timeout-minutes: 45
+    # Shared with every Valkyrian Labs APT publisher: one repository, one upload at a time.
     concurrency:
-      group: vaulthalla-apt-publish
+      group: valkyrianlabs-apt-publish
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4

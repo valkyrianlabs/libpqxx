@@ -66,10 +66,11 @@ forbidden_paths = [
 ]
 
 [publish.apt]
-# The primary distribution channel (docs/RELEASING.md): Vaulthalla's APT repository. Upload URL
-# and credentials come from the Production environment (NEXUS_REPO_URL, NEXUS_USER, NEXUS_PASS,
-# as for Vaulthalla and PDFium); RELEASE_PUBLISH_MODE=nexus enables uploads.
-repository_url = "https://apt.vaulthalla.sh"
+# The primary distribution channel (docs/RELEASING.md): the Valkyrian Labs APT repository, which
+# also serves Vaulthalla, PDFium and the other Valkyrian Labs tools (apt.vaulthalla.sh is an alias of
+# the same index). Upload URL and credentials come from the Production environment (NEXUS_REPO_URL,
+# NEXUS_USER, NEXUS_PASS, as for Vaulthalla and PDFium); RELEASE_PUBLISH_MODE=nexus enables uploads.
+repository_url = "https://apt.valkyrianlabs.com"
 suite = "stable"
 components = ["main"]
 architectures = ["amd64"]

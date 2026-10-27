@@ -10,7 +10,7 @@ This page describes the pattern; Vaulthalla's repository has not been changed.
 ## Option A: the APT package (the published channel)
 
 ```sh
-sudo apt install libpqxx-vh-dev        # from apt.vaulthalla.sh (Vaulthalla's APT repository)
+sudo apt install libpqxx-vh-dev        # from apt.valkyrianlabs.com (the Valkyrian Labs APT repository)
 ```
 
 The package installs the SDK at `/usr/lib/x86_64-linux-gnu/libpqxx-vh/` and

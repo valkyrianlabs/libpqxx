@@ -26,8 +26,10 @@ Every published version is immutable; any change of bytes is a new revision.
 
 ## Channels
 
-1. **APT (primary):** `libpqxx-vh-dev` on `https://apt.vaulthalla.sh` (suite `stable`, component
-   `main`, amd64), published with `vlr publish-deb`, exactly like Vaulthalla and PDFium.
+1. **APT (primary):** `libpqxx-vh-dev` on `https://apt.valkyrianlabs.com` (suite `stable`, component
+   `main`, amd64), published with `vlr publish-deb`, exactly like Vaulthalla and PDFium. Since
+   8.0.2-2; `https://apt.vaulthalla.sh` serves the same index, signed by the same Valkyrian Labs LLC
+   key, so consumers configured for either keep working.
 2. **GitHub release:** the `.deb`, the SDK archive (`libpqxx-sdk-<version>-<profile>.tar.zst`),
    its `.sha256`, manifest and consumer test record, and `SHA256SUMS`.
 3. **Nexus Raw (optional, later):** the relocatable SDK archive for consumers that fetch it
@@ -75,7 +77,7 @@ A manual run with `publish: dry-run` builds and validates everything without pub
 |---|---|---|
 | Self-hosted runner access | org runner group `Default` (selected repositories) | add `vaulthalla/libpqxx` |
 | `NEXUS_USER`, `NEXUS_PASS` | `Production` environment **secrets** | the Nexus APT upload account (same as Vaulthalla's/PDFium's) |
-| `NEXUS_REPO_URL` | `Production` environment variable | `https://apt.vaulthalla.sh` |
+| `NEXUS_REPO_URL` | `Production` environment variable | `https://apt.valkyrianlabs.com` |
 | `RELEASE_PUBLISH_MODE` | `Production` environment variable | `nexus` |
 | `RELEASE_FINALIZE_TOKEN` | org secret (exists) | finalize push to a protected `main` |
 | `NEXUS_RAW_REPO` | variable, only for the optional Raw channel | e.g. `https://repo.valkyrianlabs.com/repository/cpp-sdk` |
