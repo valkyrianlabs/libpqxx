@@ -1,3 +1,14 @@
+libpqxx-vh (8.0.2-2) unstable; urgency=medium
+
+  * Publish to the Valkyrian Labs APT repository (`release.toml`
+    `repository_url` = `https://apt.valkyrianlabs.com`, Production
+    `NEXUS_REPO_URL` likewise); apt.vaulthalla.sh is an alias of the same
+    index. The publish job joins the shared `valkyrianlabs-apt-publish`
+    concurrency group.
+  * Rebuild of libpqxx 8.0.2 on the current CI image (no source or ABI change).
+
+ -- Cooper Larson <cooper@valkyrianlabs.com>  Tue, 27 Oct 2026 14:38:39 +0000
+
 libpqxx-vh (8.0.2-1) unstable; urgency=medium
 
   * Package libpqxx 8.0.2 (tag 8.0.2, commit 92e7d64a3ee9) as a precompiled
